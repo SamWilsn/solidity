@@ -97,12 +97,13 @@ private:
 	bool expectExpression(Expression const& _expr);
 	bool expectDeposit(int _deposit, int _oldHeight, langutil::SourceLocation const& _location);
 
-	/// Verifies that a variable to be assigned to exists and has the same size
-	/// as the value, @a _valueSize, unless that is equal to -1.
-	bool checkAssignment(Identifier const& _assignment, size_t _valueSize = size_t(-1));
+	/// Verifies that a variable to be assigned to exists and has the same type
+	/// as the value.
+	bool checkAssignment(Identifier const& _variable, YulString _valueType);
 
 	Scope& scope(Block const* _block);
 	void expectValidType(YulString _type, langutil::SourceLocation const& _location);
+	bool expectType(YulString _expectedType, YulString _givenType, langutil::SourceLocation const& _location);
 	bool warnOnInstructions(evmasm::Instruction _instr, langutil::SourceLocation const& _location);
 	bool warnOnInstructions(std::string const& _instrIdentifier, langutil::SourceLocation const& _location);
 
@@ -112,6 +113,7 @@ private:
 	/// Variables that are active at the current point in assembly (as opposed to
 	/// "part of the scope but not yet declared")
 	std::set<Scope::Variable const*> m_activeVariables;
+	std::vector<YulString> m_typeOfCurrentExpression;
 	AsmAnalysisInfo& m_info;
 	langutil::ErrorReporter& m_errorReporter;
 	langutil::EVMVersion m_evmVersion;

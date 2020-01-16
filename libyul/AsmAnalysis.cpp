@@ -101,7 +101,14 @@ bool AsmAnalyzer::operator()(Literal const& _literal)
 	}
 	else if (_literal.kind == LiteralKind::Boolean)
 		yulAssert(_literal.value == "true"_yulstring || _literal.value == "false"_yulstring, "");
+
+	if (!m_dialect.validTypeForLiteral(_literal.kind, _literal.value, _literal.type))
+		m_errorReporter.typeError(
+			_literal.location,
+			"Invalid type \"" + _literal.type.str() + "\" for literal \"" + _literal.value.str() + "\"."
+		);
 	m_info.stackHeightInfo[&_literal] = m_stackHeight;
+	m_typeOfCurrentExpression = {_literal.type};
 	return true;
 }
 
@@ -110,6 +117,8 @@ bool AsmAnalyzer::operator()(Identifier const& _identifier)
 	yulAssert(!_identifier.name.empty(), "");
 	size_t numErrorsBefore = m_errorReporter.errors().size();
 	bool success = true;
+
+	m_typeOfCurrentExpression = {m_dialect.defaultType};
 	if (m_currentScope->lookup(_identifier.name, GenericVisitor{
 		[&](Scope::Variable const& _var)
 		{
@@ -121,6 +130,7 @@ bool AsmAnalyzer::operator()(Identifier const& _identifier)
 				);
 				success = false;
 			}
+			m_typeOfCurrentExpression = {_var.type};
 			++m_stackHeight;
 		},
 		[&](Scope::Function const&)
@@ -152,6 +162,7 @@ bool AsmAnalyzer::operator()(Identifier const& _identifier)
 		m_stackHeight += stackSize == size_t(-1) ? 1 : stackSize;
 	}
 	m_info.stackHeightInfo[&_identifier] = m_stackHeight;
+
 	return success;
 }
 
@@ -181,6 +192,8 @@ bool AsmAnalyzer::operator()(Assignment const& _assignment)
 	yulAssert(expectedItems >= 1, "");
 	int const stackHeight = m_stackHeight;
 	bool success = std::visit(*this, *_assignment.value);
+
+	// TODO this might be fully replaced by m_typeOfCurrentExpression
 	if ((m_stackHeight - stackHeight) != expectedItems)
 	{
 		m_errorReporter.declarationError(
@@ -193,9 +206,15 @@ bool AsmAnalyzer::operator()(Assignment const& _assignment)
 		);
 		return false;
 	}
-	for (auto const& variableName: _assignment.variableNames)
-		if (!checkAssignment(variableName, 1))
+
+	for (size_t i = 0; i < _assignment.variableNames.size(); ++i)
+	{
+		YulString givenType = m_dialect.defaultType;
+		if (i < m_typeOfCurrentExpression.size())
+			givenType = m_typeOfCurrentExpression[i];
+		if (!checkAssignment(_assignment.variableNames[i], givenType))
 			success = false;
+	}
 	m_info.stackHeightInfo[&_assignment] = m_stackHeight;
 	return success;
 }
@@ -230,15 +249,32 @@ bool AsmAnalyzer::operator()(VariableDeclaration const& _varDecl)
 			m_stackHeight += numVariables - numValues;
 			return false;
 		}
+
+		for (size_t i = 0; i < _varDecl.variables.size(); ++i)
+		{
+			YulString givenType = m_dialect.defaultType;
+			if (i < m_typeOfCurrentExpression.size())
+				givenType = m_typeOfCurrentExpression[i];
+			TypedName const& variable = _varDecl.variables[i];
+			expectValidType(variable.type, variable.location);
+			if (variable.type != givenType)
+			{
+				m_errorReporter.typeError(
+					variable.location,
+					"Assigning value of type \"" + givenType.str() + "\" to variable of type \"" + variable.type.str() + "."
+				);
+				success = false;
+			}
+		}
 	}
 	else
 		m_stackHeight += numVariables;
 
-	for (auto const& variable: _varDecl.variables)
-	{
-		expectValidType(variable.type, variable.location);
-		m_activeVariables.insert(&std::get<Scope::Variable>(m_currentScope->identifiers.at(variable.name)));
-	}
+	for (TypedName const& variable: _varDecl.variables)
+		m_activeVariables.insert(&std::get<Scope::Variable>(
+			m_currentScope->identifiers.at(variable.name))
+		);
+
 	m_info.stackHeightInfo[&_varDecl] = m_stackHeight;
 	return success;
 }
@@ -269,14 +305,14 @@ bool AsmAnalyzer::operator()(FunctionCall const& _funCall)
 {
 	yulAssert(!_funCall.functionName.name.empty(), "");
 	bool success = true;
-	size_t parameters = 0;
-	size_t returns = 0;
+	vector<YulString> const* parameterTypes = nullptr;
+	vector<YulString> const* returnTypes = nullptr;
 	bool needsLiteralArguments = false;
+
 	if (BuiltinFunction const* f = m_dialect.builtin(_funCall.functionName.name))
 	{
-		// TODO: compare types, too
-		parameters = f->parameters.size();
-		returns = f->returns.size();
+		parameterTypes = &f->parameters;
+		returnTypes = &f->returns;
 		if (f->literalArguments)
 			needsLiteralArguments = true;
 	}
@@ -291,9 +327,8 @@ bool AsmAnalyzer::operator()(FunctionCall const& _funCall)
 		},
 		[&](Scope::Function const& _fun)
 		{
-			/// TODO: compare types too
-			parameters = _fun.arguments.size();
-			returns = _fun.returns.size();
+			parameterTypes = &_fun.arguments;
+			returnTypes = &_fun.returns;
 		}
 	}))
 	{
@@ -302,23 +337,29 @@ bool AsmAnalyzer::operator()(FunctionCall const& _funCall)
 		success = false;
 	}
 	if (success)
-		if (_funCall.arguments.size() != parameters)
+		if (_funCall.arguments.size() != parameterTypes->size())
 		{
 			m_errorReporter.typeError(
 				_funCall.functionName.location,
 				"Function expects " +
-				to_string(parameters) +
+				to_string(parameterTypes->size()) +
 				" arguments but got " +
 				to_string(_funCall.arguments.size()) + "."
 			);
 			success = false;
 		}
 
+	vector<YulString> argTypes;
 	for (auto const& arg: _funCall.arguments | boost::adaptors::reversed)
 	{
 		if (!expectExpression(arg))
+		{
 			success = false;
-		else if (needsLiteralArguments)
+			continue;
+		}
+		argTypes.emplace_back(m_typeOfCurrentExpression.at(0));
+
+		if (needsLiteralArguments)
 		{
 			if (!holds_alternative<Literal>(arg))
 				m_errorReporter.typeError(
@@ -332,9 +373,26 @@ bool AsmAnalyzer::operator()(FunctionCall const& _funCall)
 				);
 		}
 	}
+
+	if (success)
+	{
+		yulAssert(parameterTypes && parameterTypes->size() == argTypes.size(), "");
+		for (size_t i = 0; i < parameterTypes->size(); ++i)
+			if (!expectType((*parameterTypes)[i], argTypes[i], locationOf(_funCall.arguments[i])))
+				success = false;
+	}
 	// Use argument size instead of parameter count to avoid misleading errors.
-	m_stackHeight += int(returns) - int(_funCall.arguments.size());
+	m_stackHeight += int(returnTypes ? returnTypes->size() : 0) - int(_funCall.arguments.size());
 	m_info.stackHeightInfo[&_funCall] = m_stackHeight;
+	if (success)
+	{
+		yulAssert(returnTypes, "");
+		m_typeOfCurrentExpression = *returnTypes;
+	}
+	else if (returnTypes)
+		m_typeOfCurrentExpression = vector<YulString>(returnTypes->size(), m_dialect.defaultType);
+	else
+		m_typeOfCurrentExpression = {};
 	return success;
 }
 
@@ -343,7 +401,10 @@ bool AsmAnalyzer::operator()(If const& _if)
 	bool success = true;
 
 	int const initialHeight = m_stackHeight;
+	// TODO might expect type directly
 	if (!expectExpression(*_if.condition))
+		success = false;
+	else if (!expectType(m_dialect.boolType, m_typeOfCurrentExpression.at(0), locationOf(*_if.condition)))
 		success = false;
 
 	m_stackHeight = initialHeight;
@@ -366,25 +427,14 @@ bool AsmAnalyzer::operator()(Switch const& _switch)
 	if (!expectExpression(*_switch.expression))
 		success = false;
 
-	YulString caseType;
-	bool mismatchingTypes = false;
+	YulString valueType = m_dialect.defaultType;
+	if (success)
+		valueType = m_typeOfCurrentExpression.at(0);
+
 	for (auto const& _case: _switch.cases)
 		if (_case.value)
-		{
-			if (caseType.empty())
-				caseType = _case.value->type;
-			else if (caseType != _case.value->type)
-			{
-				mismatchingTypes = true;
-				break;
-			}
-		}
-
-	if (mismatchingTypes)
-		m_errorReporter.typeError(
-			_switch.location,
-			"Switch cases have non-matching types."
-		);
+			if (!expectType(valueType, _case.value->type, _case.value->location))
+				success = false;
 
 	set<u256> cases;
 	for (auto const& _case: _switch.cases)
@@ -443,6 +493,8 @@ bool AsmAnalyzer::operator()(ForLoop const& _for)
 	m_currentScope = &scope(&_for.pre);
 
 	if (!expectExpression(*_for.condition))
+		success = false;
+	else if (!expectType(m_dialect.boolType, m_typeOfCurrentExpression.at(0), locationOf(*_for.condition)))
 		success = false;
 
 	m_stackHeight--;
@@ -543,12 +595,13 @@ bool AsmAnalyzer::expectDeposit(int _deposit, int _oldHeight, SourceLocation con
 	return true;
 }
 
-bool AsmAnalyzer::checkAssignment(Identifier const& _variable, size_t _valueSize)
+bool AsmAnalyzer::checkAssignment(Identifier const& _variable, YulString _valueType)
 {
 	yulAssert(!_variable.name.empty(), "");
 	bool success = true;
 	size_t numErrorsBefore = m_errorReporter.errors().size();
 	size_t variableSize(-1);
+	YulString variableType = m_dialect.defaultType;
 	if (Scope::Identifier const* var = m_currentScope->lookup(_variable.name))
 	{
 		// Check that it is a variable
@@ -565,6 +618,9 @@ bool AsmAnalyzer::checkAssignment(Identifier const& _variable, size_t _valueSize
 			);
 			success = false;
 		}
+		else
+			variableType = std::get<Scope::Variable>(*var).type;
+
 		variableSize = 1;
 	}
 	else if (m_resolver)
@@ -579,23 +635,32 @@ bool AsmAnalyzer::checkAssignment(Identifier const& _variable, size_t _valueSize
 			m_errorReporter.declarationError(_variable.location, "Variable not found or variable not lvalue.");
 		success = false;
 	}
-	if (_valueSize == size_t(-1))
-		_valueSize = variableSize == size_t(-1) ? 1 : variableSize;
 
-	m_stackHeight -= _valueSize;
+	m_stackHeight --;
 
-	if (_valueSize != variableSize && variableSize != size_t(-1))
+	if (variableSize != 1 && variableSize != size_t(-1))
 	{
 		m_errorReporter.typeError(
 			_variable.location,
 			"Variable size (" +
 			to_string(variableSize) +
-			") and value size (" +
-			to_string(_valueSize) +
-			") do not match."
+			") and value size (1) do not match."
 		);
 		success = false;
 	}
+
+	if (success && variableType != _valueType)
+	{
+		m_errorReporter.typeError(_variable.location,
+			"Assigning a value of type \"" +
+			_valueType.str() +
+			"\" to a variable of type \"" +
+			variableType.str() +
+			"\"."
+		);
+		success = false;
+	}
+
 	return success;
 }
 
@@ -608,11 +673,27 @@ Scope& AsmAnalyzer::scope(Block const* _block)
 }
 void AsmAnalyzer::expectValidType(YulString _type, SourceLocation const& _location)
 {
-	if (!_type.empty() && !m_dialect.types.count(_type))
+	if (!m_dialect.types.count(_type))
 		m_errorReporter.typeError(
 			_location,
 			"\"" + _type.str() + "\" is not a valid type (user defined types are not yet supported)."
 		);
+}
+
+// TODO might be better to use Expression instead of location so that location extraction is only needed in error case.
+bool AsmAnalyzer::expectType(YulString _expectedType, YulString _givenType, SourceLocation const& _location)
+{
+	if (_expectedType != _givenType)
+	{
+		m_errorReporter.typeError(_location,
+			"Expected a value of type \"" +
+			_expectedType.str() +
+			"\" but got \"" +
+			_givenType.str()
+		);
+		return false;
+	}
+	return true;
 }
 
 bool AsmAnalyzer::warnOnInstructions(std::string const& _instructionIdentifier, langutil::SourceLocation const& _location)
