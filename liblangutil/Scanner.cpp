@@ -306,9 +306,10 @@ bool Scanner::tryScanEndOfLine()
 	return false;
 }
 
-Token Scanner::scanSingleLineDocComment()
+std::pair<Token, int> Scanner::scanSingleLineDocComment()
 {
 	LiteralScope literal(this, LITERAL_TYPE_COMMENT);
+	int whitespacesAppended = 0;
 	advance(); //consume the last '/' at ///
 
 	skipWhitespaceExceptUnicodeLinebreak();
@@ -317,8 +318,12 @@ Token Scanner::scanSingleLineDocComment()
 	{
 		if (tryScanEndOfLine())
 		{
-			// check if next line is also a documentation comment
-			skipWhitespace();
+			// Check if next line is also a documentation comment.
+			// If any whitespaces were skipped, remember source position
+			// and store skipped count.
+			int startPos = m_source->position();
+			if (skipWhitespace())
+				whitespacesAppended = m_source->position() - startPos;
 			if (!m_source->isPastEndOfInput(3) &&
 				m_source->get(0) == '/' &&
 				m_source->get(1) == '/' &&
@@ -338,7 +343,7 @@ Token Scanner::scanSingleLineDocComment()
 		advance();
 	}
 	literal.complete();
-	return Token::CommentLiteral;
+	return make_pair(Token::CommentLiteral, whitespacesAppended);
 }
 
 Token Scanner::skipMultiLineComment()
@@ -427,10 +432,11 @@ Token Scanner::scanSlash()
 		{
 			// doxygen style /// comment
 			Token comment;
+			int whitespacesAppended;
 			m_skippedComments[NextNext].location.start = firstSlashPosition;
 			m_skippedComments[NextNext].location.source = m_source;
-			comment = scanSingleLineDocComment();
-			m_skippedComments[NextNext].location.end = sourcePos();
+			tie(comment, whitespacesAppended) = scanSingleLineDocComment();
+			m_skippedComments[NextNext].location.end = sourcePos() - whitespacesAppended;
 			m_skippedComments[NextNext].token = comment;
 			return Token::Whitespace;
 		}

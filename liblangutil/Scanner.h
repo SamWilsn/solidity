@@ -235,7 +235,10 @@ private:
 
 	Token scanString();
 	Token scanHexString();
-	Token scanSingleLineDocComment();
+	/// Scans a single line comment and return the count of skipped whitespaces
+	/// if end of comment was found in next line. This count is used to correct
+	/// the comments source location.
+	std::pair<Token, int> scanSingleLineDocComment();
 	Token scanMultiLineDocComment();
 	/// Scans a slash '/' and depending on the characters returns the appropriate token
 	Token scanSlash();
