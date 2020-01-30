@@ -26,28 +26,29 @@ using namespace solidity::yul;
 WasmDialect::WasmDialect()
 {
 	defaultType = "i64"_yulstring;
-	boolType = "i64"_yulstring;
+	boolType = "i32"_yulstring;
 	types = {"i64"_yulstring, "i32"_yulstring};
 
-	for (auto const& name: {
-		"i64.add",
-		"i64.sub",
-		"i64.mul",
-		"i64.div_u",
-		"i64.rem_u",
-		"i64.and",
-		"i64.or",
-		"i64.xor",
-		"i64.shl",
-		"i64.shr_u",
-		"i64.eq",
-		"i64.ne",
-		"i64.lt_u",
-		"i64.gt_u",
-		"i64.le_u",
-		"i64.ge_u"
-	})
-		addFunction(name, 2, 1);
+	for (auto t: types)
+		for (auto const& name: {
+			"add",
+			"sub",
+			"mul",
+			"div_u",
+			"rem_u",
+			"and",
+			"or",
+			"xor",
+			"shl",
+			"shr_u",
+			"eq",
+			"ne",
+			"lt_u",
+			"gt_u",
+			"le_u",
+			"ge_u"
+		})
+			addFunction(t.str() + "." + name, t, 2, 1);
 
 	m_functions["i64.lt_u"_yulstring].returns.front() = "i32"_yulstring;
 	m_functions["i64.gt_u"_yulstring].returns.front() = "i32"_yulstring;
@@ -56,34 +57,53 @@ WasmDialect::WasmDialect()
 	m_functions["i64.eq"_yulstring].returns.front() = "i32"_yulstring;
 	m_functions["i64.ne"_yulstring].returns.front() = "i32"_yulstring;
 
-	addFunction("i64.eqz", 1, 1);
+	addFunction("i32.eqz", "i32"_yulstring, 1, 1);
+	addFunction("i64.eqz", "i64"_yulstring, 1, 1);
 	m_functions["i64.eqz"_yulstring].returns.front() = "i32"_yulstring;
 
-	addFunction("i64.clz", 1, 1);
+	addFunction("i32.clz", "i32"_yulstring, 1, 1);
+	addFunction("i64.clz", "i64"_yulstring, 1, 1);
 
-	addFunction("i64.store", 2, 0, false);
+	addFunction("i32.wrap_i64", "i32"_yulstring, 1, 1);
+	m_functions["i32.wrap_i64"_yulstring].parameters.front() = "i64"_yulstring;
+
+	addFunction("i64.extend_i32_u", "i64"_yulstring, 1, 1);
+	m_functions["i64.extend_i32_u"_yulstring].parameters.front() = "i32"_yulstring;
+
+	addFunction("i32.store", "i32"_yulstring, 2, 0, false);
+	m_functions["i32.store"_yulstring].sideEffects.invalidatesStorage = false;
+	addFunction("i64.store", "i64"_yulstring, 2, 0, false);
 	m_functions["i64.store"_yulstring].parameters.front() = "i32"_yulstring;
 	m_functions["i64.store"_yulstring].sideEffects.invalidatesStorage = false;
 
-	addFunction("i64.store8", 2, 0, false);
+	addFunction("i32.store8", "i32"_yulstring, 2, 0, false);
+	m_functions["i32.store8"_yulstring].sideEffects.invalidatesStorage = false;
+	addFunction("i64.store8", "i64"_yulstring, 2, 0, false);
 	m_functions["i64.store8"_yulstring].parameters.front() = "i32"_yulstring;
 	m_functions["i64.store8"_yulstring].sideEffects.invalidatesStorage = false;
 
-	addFunction("i64.load", 1, 1, false);
+	addFunction("i32.load", "i32"_yulstring, 1, 1, false);
+	m_functions["i32.load"_yulstring].sideEffects.invalidatesStorage = false;
+	m_functions["i32.load"_yulstring].sideEffects.invalidatesMemory = false;
+	m_functions["i32.load"_yulstring].sideEffects.sideEffectFree = true;
+	m_functions["i32.load"_yulstring].sideEffects.sideEffectFreeIfNoMSize = true;
+	addFunction("i64.load", "i64"_yulstring, 1, 1, false);
 	m_functions["i64.load"_yulstring].parameters.front() = "i32"_yulstring;
 	m_functions["i64.load"_yulstring].sideEffects.invalidatesStorage = false;
 	m_functions["i64.load"_yulstring].sideEffects.invalidatesMemory = false;
 	m_functions["i64.load"_yulstring].sideEffects.sideEffectFree = true;
 	m_functions["i64.load"_yulstring].sideEffects.sideEffectFreeIfNoMSize = true;
 
-	addFunction("drop", 1, 0);
+	// Drop is actually overloaded for all types, but Yul does not support that.
+	// We could introduce "i32.drop".
+	addFunction("drop", "i64"_yulstring, 1, 0);
 
-	addFunction("unreachable", 0, 0, false);
+	addFunction("unreachable", {}, 0, 0, false);
 	m_functions["unreachable"_yulstring].sideEffects.invalidatesStorage = false;
 	m_functions["unreachable"_yulstring].sideEffects.invalidatesMemory = false;
 
-	addFunction("datasize", 1, 1, true, true);
-	addFunction("dataoffset", 1, 1, true, true);
+	addFunction("datasize", "i64"_yulstring, 1, 1, true, true);
+	addFunction("dataoffset", "i64"_yulstring, 1, 1, true, true);
 
 	addEthereumExternals();
 }
@@ -167,6 +187,7 @@ void WasmDialect::addEthereumExternals()
 
 void WasmDialect::addFunction(
 	string _name,
+	YulString _type,
 	size_t _params,
 	size_t _returns,
 	bool _movable,
@@ -176,8 +197,8 @@ void WasmDialect::addFunction(
 	YulString name{move(_name)};
 	BuiltinFunction& f = m_functions[name];
 	f.name = name;
-	f.parameters.resize(_params);
-	f.returns.resize(_returns);
+	f.parameters.resize(_params, _type);
+	f.returns.resize(_returns, _type);
 	f.sideEffects = _movable ? SideEffects{} : SideEffects::worst();
 	f.isMSize = false;
 	f.literalArguments = _literalArguments;

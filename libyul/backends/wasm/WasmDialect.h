@@ -56,7 +56,14 @@ struct WasmDialect: public Dialect
 private:
 	void addEthereumExternals();
 
-	void addFunction(std::string _name, size_t _params, size_t _returns, bool _movable = true, bool _literalArguments = false);
+	void addFunction(
+		std::string _name,
+		YulString _type,
+		size_t _params,
+		size_t _returns,
+		bool _movable = true,
+		bool _literalArguments = false
+	);
 
 	std::map<YulString, BuiltinFunction> m_functions;
 };
