@@ -49,24 +49,24 @@ using namespace solidity::langutil;
 namespace
 {
 static string const polyfill{R"({
-function or_bool(a, b, c, d) -> r {
-	r := i64.or(i64.or(a, b), i64.or(c, d))
+function or_bool(a, b, c, d) -> r:i32 {
+	r := i32.eqz(iszero256(a, b, c, d))
 }
-function or_bool_320(a, b, c, d, e) -> r {
-	r := i64.or(or_bool(a, b, c, d), e)
+function or_bool_320(a, b, c, d, e) -> r:i32 {
+	r := i32.or(or_bool(a, b, c, d), e)
 }
-function or_bool_512(a, b, c, d, e, f, g, h) -> r {
-	r := i64.or(or_bool(a, b, c, d), or_bool(e, f, g, h))
+function or_bool_512(a, b, c, d, e, f, g, h) -> r:i32 {
+	r := i32.or(or_bool(a, b, c, d), or_bool(e, f, g, h))
 }
 // returns a + y + c plus carry value on 64 bit values.
 // c should be at most 1
 function add_carry(x, y, c) -> r, r_c {
 	let t := i64.add(x, y)
 	r := i64.add(t, c)
-	r_c := i64.or(
+	r_c := i64.extend_i32_u(i32.or(
 		i64.lt_u(t, x),
 		i64.lt_u(r, t)
-	)
+	))
 }
 function add(x1, x2, x3, x4, y1, y2, y3, y4) -> r1, r2, r3, r4 {
 	let carry
@@ -254,8 +254,8 @@ function div(x1, x2, x3, x4, y1, y2, y3, y4) -> r1, r2, r3, r4 {
 	let m3 := 0
 	let m4 := 1
 
-	for {} 1 {} {
-		if i64.or(i64.eqz(i64.clz(y1)), gte_256x256_64(y1, y2, y3, y4, x1, x2, x3, x4)) {
+	for {} true {} {
+		if i32.or(i64.eqz(i64.clz(y1)), gte_256x256_64(y1, y2, y3, y4, x1, x2, x3, x4)) {
 			break
 		}
 		y1, y2, y3, y4 := shl_internal(1, y1, y2, y3, y4)
@@ -320,8 +320,8 @@ function mod(x1, x2, x3, x4, y1, y2, y3, y4) -> r1, r2, r3, r4 {
 	let m3 := 0
 	let m4 := 1
 
-	for {} 1 {} {
-		if i64.or(i64.eqz(i64.clz(y1)), gte_256x256_64(y1, y2, y3, y4, r1, r2, r3, r4)) {
+	for {} true {} {
+		if i32.or(i64.eqz(i64.clz(y1)), gte_256x256_64(y1, y2, y3, y4, r1, r2, r3, r4)) {
 			break
 		}
 
@@ -356,8 +356,8 @@ function mod320(x1, x2, x3, x4, x5, y1, y2, y3, y4, y5) -> r1, r2, r3, r4, r5 {
 	r4 := x4
 	r5 := x5
 
-	for {} 1 {} {
-		if i64.or(i64.eqz(i64.clz(y1)), gte_320x320_64(y1, y2, y3, y4, y5, r1, r2, r3, r4, r5)) {
+	for {} true {} {
+		if i32.or(i64.eqz(i64.clz(y1)), gte_320x320_64(y1, y2, y3, y4, y5, r1, r2, r3, r4, r5)) {
 			break
 		}
 		y1, y2, y3, y4, y5 := shl320_internal(1, y1, y2, y3, y4, y5)
@@ -397,8 +397,8 @@ function mod512(x1, x2, x3, x4, x5, x6, x7, x8, y1, y2, y3, y4, y5, y6, y7, y8) 
 	r7 := x7
 	r8 := x8
 
-	for {} 1 {} {
-		if i64.or(
+	for {} true {} {
+		if i32.or(
 				i64.eqz(i64.clz(y1)),
 				gte_512x512_64(y1, y2, y3, y4, y5, y6, y7, y8, r1, r2, r3, r4, r5, r6, r7, r8)
 			)
@@ -502,13 +502,13 @@ function not(x1, x2, x3, x4) -> r1, r2, r3, r4 {
 function iszero(x1, x2, x3, x4) -> r1, r2, r3 ,r4 {
 	r4 := iszero256(x1, x2, x3, x4)
 }
-function iszero256(x1, x2, x3, x4) -> r {
+function iszero256(x1, x2, x3, x4) -> r:i32 {
 	r := i64.eqz(i64.or(i64.or(x1, x2), i64.or(x3, x4)))
 }
-function iszero320(x1, x2, x3, x4, x5) -> r {
+function iszero320(x1, x2, x3, x4, x5) -> r:i32 {
 	r := i64.eqz(i64.or(i64.or(i64.or(x1, x2), i64.or(x3, x4)), x5))
 }
-function iszero512(x1, x2, x3, x4, x5, x6, x7, x8) -> r {
+function iszero512(x1, x2, x3, x4, x5, x6, x7, x8) -> r:i32 {
 	r := i64.and(iszero256(x1, x2, x3, x4), iszero256(x5, x6, x7, x8))
 }
 function eq(x1, x2, x3, x4, y1, y2, y3, y4) -> r1, r2, r3, r4 {
@@ -596,7 +596,7 @@ function lt_512x512_64(x1, x2, x3, x4, x5, x6, x7, x8, y1, y2, y3, y4, y5, y6, y
 // Split long string to make it compilable on msvc
 // https://docs.microsoft.com/en-us/cpp/error-messages/compiler-errors-1/compiler-error-c2026?view=vs-2019
 R"(
-function lt_256x256_64(x1, x2, x3, x4, y1, y2, y3, y4) -> z {
+function lt_256x256_64(x1, x2, x3, x4, y1, y2, y3, y4) -> z:i32 {
 	switch cmp(x1, y1)
 	case 0 {
 		switch cmp(x2, y2)
@@ -617,13 +617,13 @@ function lt_256x256_64(x1, x2, x3, x4, y1, y2, y3, y4) -> z {
 function lt(x1, x2, x3, x4, y1, y2, y3, y4) -> z1, z2, z3, z4 {
 	z4 := lt_256x256_64(x1, x2, x3, x4, y1, y2, y3, y4)
 }
-function gte_256x256_64(x1, x2, x3, x4, y1, y2, y3, y4) -> z {
+function gte_256x256_64(x1, x2, x3, x4, y1, y2, y3, y4) -> z:i32 {
 	z := i64.eqz(lt_256x256_64(x1, x2, x3, x4, y1, y2, y3, y4))
 }
-function gte_320x320_64(x1, x2, x3, x4, x5, y1, y2, y3, y4, y5) -> z {
+function gte_320x320_64(x1, x2, x3, x4, x5, y1, y2, y3, y4, y5) -> z:i32 {
 	z := i64.eqz(lt_320x320_64(x1, x2, x3, x4, x5, y1, y2, y3, y4, y5))
 }
-function gte_512x512_64(x1, x2, x3, x4, x5, x6, x7, x8, y1, y2, y3, y4, y5, y6, y7, y8) -> z {
+function gte_512x512_64(x1, x2, x3, x4, x5, x6, x7, x8, y1, y2, y3, y4, y5, y6, y7, y8) -> z:i32 {
 	z := i64.eqz(lt_512x512_64(x1, x2, x3, x4, x5, x6, x7, x8, y1, y2, y3, y4, y5, y6, y7, y8))
 }
 function gt(x1, x2, x3, x4, y1, y2, y3, y4) -> z1, z2, z3, z4 {
@@ -646,7 +646,7 @@ function shl_single(a, amount) -> x, y {
 }
 
 function shl(x1, x2, x3, x4, y1, y2, y3, y4) -> z1, z2, z3, z4 {
-	if i64.and(i64.eqz(x1), i64.eqz(x2)) {
+	if i32.and(i64.eqz(x1), i64.eqz(x2)) {
 		if i64.eqz(x3) {
 			if i64.lt_u(x4, 256) {
 				if i64.ge_u(x4, 128) {
@@ -683,7 +683,7 @@ function shr_single(a, amount) -> x, y {
 }
 
 function shr(x1, x2, x3, x4, y1, y2, y3, y4) -> z1, z2, z3, z4 {
-	if i64.and(i64.eqz(x1), i64.eqz(x2)) {
+	if i32.and(i64.eqz(x1), i64.eqz(x2)) {
 		if i64.eqz(x3) {
 			if i64.lt_u(x4, 256) {
 				if i64.ge_u(x4, 128) {
