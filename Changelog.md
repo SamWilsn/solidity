@@ -1,6 +1,7 @@
 ### 0.6.3 (unreleased)
 
 Language Features:
+ * Report source locations for structured documentation errors.
 
 
 
