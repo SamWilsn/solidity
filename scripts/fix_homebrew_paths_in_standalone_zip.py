@@ -55,7 +55,7 @@ def readDependencies(fname):
                         command = "install_name_tool -change " + \
                             library + " @executable_path/./" + \
                             os.path.basename(library) + " " + fname
-                        print command
+                        print(command)
                         os.system("chmod +w " + fname)
                         os.system(command)
 
