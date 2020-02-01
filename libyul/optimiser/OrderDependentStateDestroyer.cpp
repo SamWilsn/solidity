@@ -53,7 +53,6 @@ using namespace solidity;
 using namespace solidity::yul;
 
 enum class Virtue { Clean = 0, Undecided, MaybeTainted, Tainted };
-enum class Sensitivity { Numb = 0, Undecided, Sensitive };
 
 struct Function
 {
@@ -186,7 +185,6 @@ public:
     {
         Variable v;
         v.m_virtue = Virtue::Undecided;
-        v.m_sensitivity = Sensitivity::Undecided;
 
         return v;
     }
@@ -195,7 +193,6 @@ public:
     {
         Variable v;
         v.m_virtue = Virtue::Undecided;
-        v.m_sensitivity = Sensitivity::Undecided;
 
         return v;
     }
@@ -218,7 +215,6 @@ public:
         }
     }
 
-    Sensitivity sensitivity() const { return m_sensitivity; }
 
     void set_tainted()
     {
@@ -255,7 +251,6 @@ private:
     Variable() = default;
 
     Virtue m_virtue;
-    Sensitivity m_sensitivity;
 };
 
 class FunctionSensitivityAnalyzer: public ASTWalker
@@ -1033,190 +1028,4 @@ void OrderDependentStateDestroyer::run(OptimiserStepContext& _context, Block& _a
     fsa.taint();
     fsa.dump_state();
     fsa.verify();
-}
-
-// EVERYTHING BELOW HERE IS GARBAGE
-
-void OrderDependentStateDestroyer::operator()(Assignment const& _assignment)
-{
-    m_stack.emplace(Var::Clean);
-	visit(*_assignment.value);
-	Var v = m_stack.top();
-	m_stack.pop();
-
-    for (Identifier const& ident: _assignment.variableNames)
-    {
-        if (v.virtue() != Var::Clean) {
-            std::cout << ident.name.str() << " is " << v.virtue_str() << std::endl;
-        }
-        m_variables.at(ident.name).join(v);
-    }
-}
-
-void OrderDependentStateDestroyer::operator()(FunctionDefinition const& _funDef)
-{
-    std::vector<YulString> params;
-
-    for (TypedName const& x: _funDef.parameters)
-    {
-        params.push_back(x.name);
-
-        Var param(Var::Undecided);
-        param.add_arg(x.name);
-        newVar(x.name, param);
-    }
-
-    for (TypedName const& x: _funDef.returnVariables)
-    {
-        newVar(x.name, Var(Var::Clean));
-    }
-
-    m_functions[_funDef.name] = params;
-
-    (*this)(_funDef.body);
-}
-
-void OrderDependentStateDestroyer::operator()(VariableDeclaration const& _variableDeclaration)
-{
-    // TODO - SW: Track multiple assignments separately.
-    Var v(Var::Clean);
-
-    if (_variableDeclaration.value) {
-        m_stack.push(v);
-        visit(*_variableDeclaration.value);
-        v = m_stack.top();
-        m_stack.pop();
-    }
-
-    for (TypedName const& tn: _variableDeclaration.variables) {
-        if (v.virtue() != Var::Clean) {
-            std::cout << tn.name.str() << " is " << v.virtue_str() << std::endl;
-        }
-        newVar(tn.name, v);
-    }
-}
-
-void OrderDependentStateDestroyer::newVar(YulString const& name, Var v)
-{
-    auto it = m_variables.find(name);
-    assertThrow(it == m_variables.end(), OptimizerException, "variable already exists");
-
-    m_variables[name].join(v);
-}
-
-void OrderDependentStateDestroyer::operator()(FunctionCall const& _funCall)
-{
-    if (EVMDialect const* dialect = dynamic_cast<EVMDialect const*>(&m_dialect))
-    {
-        if (auto const* builtin = dialect->builtin(_funCall.functionName.name))
-        {
-            this->visitBuiltin(_funCall, builtin);
-        }
-        else
-        {
-            this->visitFunc(_funCall);
-        }
-    }
-}
-
-void OrderDependentStateDestroyer::visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionForEVM const* _builtin)
-{
-    if (!_builtin->instruction)
-        return;
-
-    switch (*_builtin->instruction)
-    {
-        case evmasm::Instruction::MLOAD:
-            m_stack.top().undecide();
-            break;
-
-        case evmasm::Instruction::SLOAD:
-            m_stack.top().taint();
-            checkStateAccess(_funCall);
-            break;
-
-        case evmasm::Instruction::SSTORE:
-            visit(_funCall.arguments[1]);
-            checkStateAccess(_funCall);
-            break;
-
-        default:
-            break;
-    }
-}
-
-void OrderDependentStateDestroyer::checkStateAccess(FunctionCall const& _funCall)
-{
-    Var v(Var::Clean);
-
-    Expression const& expr = _funCall.arguments[0];
-
-    if (!holds_alternative<Identifier>(expr))
-    {
-        assertThrow(false, OptimizerException, "Only identifiers supported for SLOAD/SSTORE");
-    }
-
-    Identifier const& ident = std::get<Identifier>(expr);
-    v.join(m_variables.at(ident.name));
-
-    std::cout
-        << _funCall.functionName.name.str()
-        << " "
-        << ident.name.str()
-        << " [";
-
-    for (YulString const& arg: v.args())
-    {
-        m_variables.at(arg).sensitive = true;
-        std::cout << arg.str() << ", ";
-    }
-
-    std::cout << "]" << std::endl;
-
-    switch (v.virtue())
-    {
-        case Var::Undecided:
-            std::cout << "undecided state access at " << _funCall.location << std::endl;
-            break;
-
-        case Var::Tainted:
-            std::cout << "tainted state access at " << _funCall.location << std::endl;
-            break;
-
-        default:
-            break;
-    }
-}
-
-void OrderDependentStateDestroyer::visitFunc(FunctionCall const& _funCall)
-{
-    std::vector<YulString> params;
-
-    for (Expression const& expr: _funCall.arguments)
-    {
-        if (holds_alternative<Literal>(expr))
-        {
-            params.push_back(YulString("!!LITERAL"));
-            continue;
-        }
-
-        assertThrow(
-            holds_alternative<Identifier>(expr),
-            OptimizerException,
-            "Function parameters must be literals or identifiers"
-        );
-
-        Identifier const& ident = std::get<Identifier>(expr);
-
-        params.push_back(ident.name);
-    }
-
-    FnCall fn_call;
-    fn_call.params = params;
-    fn_call.name = _funCall.functionName.name;
-
-    m_callsites.push_back(fn_call);
-
-
-    // TODO: Check if return variables are tainted, and if so, taint.
 }
