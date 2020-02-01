@@ -50,6 +50,7 @@
 #include <libyul/optimiser/StructuralSimplifier.h>
 #include <libyul/optimiser/SyntacticalEquality.h>
 #include <libyul/optimiser/RedundantAssignEliminator.h>
+#include <libyul/optimiser/OrderDependentStateDestroyer.h>
 #include <libyul/optimiser/VarNameCleaner.h>
 #include <libyul/optimiser/LoadResolver.h>
 #include <libyul/optimiser/LoopInvariantCodeMotion.h>
@@ -128,11 +129,17 @@ void OptimiserSuite::run(
 				SSATransform::name,
 				RedundantAssignEliminator::name,
 				RedundantAssignEliminator::name,
+				OrderDependentStateDestroyer::name,
+			}, ast);
+			cout << yul::AsmPrinter()(ast) << endl;
+			/*
 				ExpressionSimplifier::name,
 				CommonSubexpressionEliminator::name,
 				LoadResolver::name,
 				LoopInvariantCodeMotion::name
 			}, ast);
+			*/
+			return;
 		}
 
 		{
@@ -361,6 +368,7 @@ map<string, unique_ptr<OptimiserStep>> const& OptimiserSuite::allSteps()
 			LoadResolver,
 			LoopInvariantCodeMotion,
 			RedundantAssignEliminator,
+			OrderDependentStateDestroyer,
 			Rematerialiser,
 			SSAReverser,
 			SSATransform,

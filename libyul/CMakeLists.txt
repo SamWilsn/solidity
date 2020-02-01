@@ -127,6 +127,8 @@ add_library(yul
 	optimiser/OptimizerUtilities.h
 	optimiser/RedundantAssignEliminator.cpp
 	optimiser/RedundantAssignEliminator.h
+	optimiser/OrderDependentStateDestroyer.cpp
+	optimiser/OrderDependentStateDestroyer.h
 	optimiser/Rematerialiser.cpp
 	optimiser/Rematerialiser.h
 	optimiser/SSAReverser.cpp
