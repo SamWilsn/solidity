@@ -18,6 +18,7 @@
  * Optimiser component that destroys order-dependent state accesses.
  */
 
+#include <libyul/AsmPrinter.h>
 #include "libyul/Dialect.h"
 #include "libyul/YulString.h"
 #include "libyul/backends/evm/EVMDialect.h"
@@ -67,6 +68,42 @@ struct CallSite
     std::vector<YulString> returns;
 };
 
+enum class BlockType
+{
+    Root,
+    Function,
+    For,
+    If,
+};
+
+class TaintBlock
+{
+public:
+    TaintBlock() = delete;
+    explicit TaintBlock(BlockType bt);
+
+    BlockType type() const { return m_type; }
+    YulString const& name() const { return m_name; }
+
+private:
+    static unsigned int s_block_count;
+
+    YulString m_name;
+    BlockType m_type;
+    std::vector<YulString> m_conditions;
+};
+
+unsigned int TaintBlock::s_block_count;
+
+TaintBlock::TaintBlock(BlockType bt) : m_type(bt)
+{
+    std::stringstream ss;
+    ss << "!!block_" << s_block_count;
+    m_name = YulString(ss.str());
+
+    s_block_count += 1;
+}
+
 class Variable;
 
 class Scope
@@ -79,6 +116,7 @@ public:
 	void influences(YulString _upstream, YulString _downstream);
 	void influences(Expression const& _upstream, YulString _downstream);
 	void dump_state() const;
+    std::vector<YulString> find_path(YulString const& source, YulString const& dest) const;
 
 private:
     std::map<YulString, std::set<YulString>> m_graph;
@@ -150,6 +188,57 @@ void Scope::influences(YulString _upstream, YulString _downstream)
     m_graph[_upstream].insert(_downstream);
 }
 
+std::vector<YulString> Scope::find_path(YulString const& source, YulString const& dest) const
+{
+    struct Foo
+    {
+        std::vector<YulString> path;
+        YulString next;
+    };
+
+    std::set<YulString> found;
+    found.insert(source);
+
+    std::stack<Foo> to_explore;
+
+    Foo initial;
+    initial.next = source;
+
+    to_explore.push(initial);
+
+    while (!to_explore.empty())
+    {
+        Foo top = to_explore.top();
+        to_explore.pop();
+
+        std::vector<YulString> path(top.path);
+        path.push_back(top.next);
+
+        if (m_graph.end() == m_graph.find(top.next))
+            continue;
+
+        for (YulString const& name: m_graph.at(top.next))
+        {
+            if (name == dest)
+            {
+                return path;
+            }
+
+            if (found.insert(name).second)
+            {
+                Foo next;
+                next.next = name;
+                next.path = path;
+
+                to_explore.push(next);
+            }
+        }
+    }
+
+    std::vector<YulString> aoeu;
+    return aoeu;
+}
+
 std::set<YulString> Scope::find_downstream(YulString const& source) const
 {
     std::set<YulString> found;
@@ -218,18 +307,7 @@ public:
 
     void set_tainted()
     {
-        switch (m_virtue)
-        {
-            case Virtue::MaybeTainted:
-            case Virtue::Tainted:
-            case Virtue::Undecided:
-                m_virtue = Virtue::Tainted;
-                break;
-
-            default:
-                assertThrow(false, OptimizerException, "conflict: already clean");
-                break;
-        }
+        m_virtue = Virtue::Tainted;
     }
 
     void set_clean()
@@ -256,7 +334,7 @@ private:
 class FunctionSensitivityAnalyzer: public ASTWalker
 {
 public:
-	explicit FunctionSensitivityAnalyzer(Dialect const& _dialect): m_dialect(_dialect) {}
+	explicit FunctionSensitivityAnalyzer(Dialect const& _dialect);
 
     using ASTWalker::operator();
 
@@ -264,6 +342,7 @@ public:
     void operator()(VariableDeclaration const& _variableDeclaration) override;
     void operator()(Assignment const& _assignment) override;
     void operator()(FunctionCall const& _funCall) override;
+    void operator()(If const& _if) override;
 
     void dump_state() const;
     void resolve();
@@ -288,6 +367,8 @@ private:
 
     std::vector<Scope> m_function_scopes;
 
+    std::stack<TaintBlock> m_blocks;
+
     YulString currentCaller();
 
     void taint_scope(Scope const&);
@@ -309,7 +390,17 @@ private:
 
 	void untaintable(Expression const&);
 	void untaintable(YulString);
+
+	TaintBlock const& currentBlock() const { return m_blocks.top(); }
+
+	void enterBlock(BlockType type);
+	void leaveBlock(BlockType type);
 };
+
+FunctionSensitivityAnalyzer::FunctionSensitivityAnalyzer(Dialect const& _dialect): m_dialect(_dialect)
+{
+    m_blocks.emplace(BlockType::Root);
+}
 
 void FunctionSensitivityAnalyzer::untaintable(YulString _name)
 {
@@ -558,6 +649,23 @@ void FunctionSensitivityAnalyzer::dump_state() const
                 << std::endl;
         }
     }
+
+    for (Scope const& scope: m_function_scopes)
+    {
+        Scope merged = Scope::join(m_root_scope, scope);
+
+        std::cout << "Path from _58 to vloc_windex_16:" << std::endl;
+        std::cout << "\t";
+
+        auto path = merged.find_path(YulString("_58"), YulString("vloc_windex_16"));
+
+        for (YulString const& foo: path)
+        {
+            std::cout << foo.str() << " -> ";
+        }
+
+        std::cout << std::endl;
+    }
 }
 
 void FunctionSensitivityAnalyzer::enterAssignment(std::vector<YulString> _vars)
@@ -574,10 +682,26 @@ void FunctionSensitivityAnalyzer::leaveAssignment(std::vector<YulString> const& 
     m_current_assignment.reset();
 }
 
+void FunctionSensitivityAnalyzer::enterBlock(BlockType type)
+{
+    YulString const& top = currentBlock().name();
+    m_blocks.emplace(type);
+    m_root_scope.influences(top, m_blocks.top().name());
+    addVariable(currentBlock().name(), Variable::variable());
+}
+
+void FunctionSensitivityAnalyzer::leaveBlock(BlockType type)
+{
+    assertThrow(m_blocks.top().type() == type, OptimizerException, "mismatched block");
+    m_blocks.pop();
+}
+
 void FunctionSensitivityAnalyzer::enterFunction(FunctionDefinition const& _funDef)
 {
     assertThrow(!m_current_function.has_value(), OptimizerException, "double def");
     m_current_function.emplace(_funDef.name);
+    enterBlock(BlockType::Function);
+    std::cout << currentBlock().name().str() << " is function " << _funDef.name.str() << std::endl;
 }
 
 void FunctionSensitivityAnalyzer::leaveFunction(FunctionDefinition const& _funDef)
@@ -586,6 +710,7 @@ void FunctionSensitivityAnalyzer::leaveFunction(FunctionDefinition const& _funDe
     assertThrow(_funDef.name == *m_current_function, OptimizerException, "mismatched func");
 
     m_current_function.reset();
+    leaveBlock(BlockType::Function);
 }
 
 void FunctionSensitivityAnalyzer::addFunction(YulString _name, Function _func)
@@ -600,6 +725,21 @@ void FunctionSensitivityAnalyzer::addVariable(YulString _name, Variable _var)
     auto it = m_variables.find(_name);
     assertThrow(it == m_variables.end(), OptimizerException, "duplicate variable");
     m_variables.emplace(std::make_pair(_name, _var));
+}
+
+void FunctionSensitivityAnalyzer::operator()(If const& _if)
+{
+    const Expression& cond_expr = *_if.condition;
+    assertThrow(holds_alternative<Identifier>(cond_expr), OptimizerException, "if with non-identifier");
+
+    const Identifier& cond_ident = std::get<Identifier>(cond_expr);
+
+    enterBlock(BlockType::If);
+    m_root_scope.influences(cond_ident.name, currentBlock().name());
+    std::cout << currentBlock().name().str() << " is if (" << cond_ident.name.str() << ")" << std::endl;
+
+    (*this)(_if.body);
+    leaveBlock(BlockType::If);
 }
 
 void FunctionSensitivityAnalyzer::operator()(FunctionDefinition const& _funDef)
@@ -934,6 +1074,12 @@ void FunctionSensitivityAnalyzer::operator()(VariableDeclaration const& _variabl
         addVariable(tn.name, Variable::variable());
     }
 
+	auto const &cb = currentBlock();
+	for (TypedName const& v: _variableDeclaration.variables)
+    {
+        m_root_scope.influences(cb.name(), v.name);
+    }
+
     if (holds_alternative<Identifier>(*_variableDeclaration.value))
     {
         assertThrow(
@@ -978,6 +1124,12 @@ void FunctionSensitivityAnalyzer::operator()(VariableDeclaration const& _variabl
 
 void FunctionSensitivityAnalyzer::operator()(Assignment const& _assignment)
 {
+	auto const &cb = currentBlock();
+	for (Identifier const& v: _assignment.variableNames)
+    {
+        m_root_scope.influences(cb.name(), v.name);
+    }
+
     if (holds_alternative<Identifier>(*_assignment.value))
     {
         assertThrow(
@@ -1022,6 +1174,8 @@ void FunctionSensitivityAnalyzer::operator()(Assignment const& _assignment)
 
 void OrderDependentStateDestroyer::run(OptimiserStepContext& _context, Block& _ast)
 {
+    std::cout << yul::AsmPrinter()(_ast) << std::endl;
+
     FunctionSensitivityAnalyzer fsa(_context.dialect);
     (fsa)(_ast);
     fsa.resolve();
