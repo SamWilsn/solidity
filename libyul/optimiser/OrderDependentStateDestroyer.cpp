@@ -43,6 +43,7 @@
 #include <boost/range/algorithm_ext/erase.hpp>
 #include <map>
 #include <optional>
+#include <ostream>
 #include <set>
 #include <stack>
 #include <unordered_map>
@@ -371,7 +372,7 @@ private:
 
     YulString currentCaller();
 
-    void taint_scope(Scope const&);
+    void taintScope(Scope const&);
     void visitFunc(FunctionCall const&);
     void visitBuiltin(FunctionCall const&, BuiltinFunctionForEVM const*);
 
@@ -395,6 +396,8 @@ private:
 
 	void enterBlock(BlockType type);
 	void leaveBlock(BlockType type);
+
+    void printAllPaths(YulString const& src, YulString const& dst) const;
 };
 
 FunctionSensitivityAnalyzer::FunctionSensitivityAnalyzer(Dialect const& _dialect): m_dialect(_dialect)
@@ -426,22 +429,31 @@ void FunctionSensitivityAnalyzer::verify()
     for (YulString const& untaintable: m_untaintable)
     {
         Variable const& var = m_variables.at(untaintable);
+
+        if (var.virtue() == Virtue::Tainted)
+        {
+            for (YulString const& to_taint: m_to_taint)
+            {
+                printAllPaths(to_taint, untaintable);
+            }
+        }
+
         assertThrow(var.virtue() != Virtue::Tainted, OptimizerException, "tainted variable used");
     }
 }
 
 void FunctionSensitivityAnalyzer::taint()
 {
-    taint_scope(m_root_scope);
+    taintScope(m_root_scope);
 
     for (Scope const& scope: m_function_scopes)
     {
         Scope joined = Scope::join(m_root_scope, scope);
-        taint_scope(joined);
+        taintScope(joined);
     }
 }
 
-void FunctionSensitivityAnalyzer::taint_scope(Scope const& scope)
+void FunctionSensitivityAnalyzer::taintScope(Scope const& scope)
 {
     for (YulString const& name: m_to_taint)
     {
@@ -628,6 +640,12 @@ void FunctionSensitivityAnalyzer::dump_state() const
     std::cout << std::endl;
     m_root_scope.dump_state();
 
+    for (auto const& fscope: m_function_scopes)
+    {
+        std::cout << std::endl;
+        fscope.dump_state();
+    }
+
     std::cout << std::endl;
     std::cout << "Unresolved Function Calls:" << std::endl;
 
@@ -649,22 +667,42 @@ void FunctionSensitivityAnalyzer::dump_state() const
                 << std::endl;
         }
     }
+}
 
-    for (Scope const& scope: m_function_scopes)
+void FunctionSensitivityAnalyzer::printAllPaths(YulString const& src, YulString const& dst) const
+{
+    auto path = m_root_scope.find_path(src, dst);
+
+    if (!path.empty())
     {
-        Scope merged = Scope::join(m_root_scope, scope);
-
-        std::cout << "Path from _58 to vloc_windex_16:" << std::endl;
+        std::cout << "Path from " << src.str() << " to " << dst.str() << ":" << std::endl;
         std::cout << "\t";
-
-        auto path = merged.find_path(YulString("_58"), YulString("vloc_windex_16"));
 
         for (YulString const& foo: path)
         {
             std::cout << foo.str() << " -> ";
         }
 
-        std::cout << std::endl;
+        std::cout << dst.str() << std::endl;
+    }
+
+    for (Scope const& scope: m_function_scopes)
+    {
+        Scope merged = Scope::join(m_root_scope, scope);
+        auto path = merged.find_path(src, dst);
+
+        if (path.empty()) continue;
+
+        std::cout << "Path from " << src.str() << " to " << dst.str() << ":" << std::endl;
+        std::cout << "\t";
+
+
+        for (YulString const& foo: path)
+        {
+            std::cout << foo.str() << " -> ";
+        }
+
+        std::cout << dst.str() << std::endl;
     }
 }
 
