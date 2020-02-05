@@ -42,11 +42,14 @@
 
 #include <boost/range/algorithm_ext/erase.hpp>
 #include <map>
+#include <memory>
 #include <optional>
 #include <ostream>
 #include <set>
 #include <stack>
+#include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -54,18 +57,1039 @@ using namespace std;
 using namespace solidity;
 using namespace solidity::yul;
 
-enum class Virtue { Clean = 0, Undecided, MaybeTainted, Tainted };
-
-struct Function
-{
-    std::vector<YulString> parameters;
-    std::vector<YulString> returns;
-};
+static const YulString MAIN("!!main");
 
 struct CallSite
 {
     YulString callee;
     std::vector<std::optional<YulString>> arguments;
+    std::vector<YulString> returns;
+};
+
+enum class Virtue { Clean = 0, Undecided, Tainted };
+
+class Variable
+{
+public:
+    Variable(YulString _name, Virtue _virtue = Virtue::Undecided):
+        m_name(_name), m_virtue(_virtue), m_protected(false) {}
+
+    Virtue virtue() const { return m_virtue; }
+    const char* virtue_str() const
+    {
+        switch (m_virtue)
+        {
+            case Virtue::Undecided:
+                return "Undecided";
+            case Virtue::Clean:
+                return "Clean";
+            case Virtue::Tainted:
+                return "Tainted";
+            default:
+                return "";
+        }
+    }
+
+    bool isProtected() const { return m_protected; }
+
+    void setProtected()
+    {
+        m_protected = true;
+    }
+
+    void setTainted()
+    {
+        m_virtue = Virtue::Tainted;
+    }
+
+    void setClean()
+    {
+        switch (m_virtue)
+        {
+            case Virtue::Clean:
+            case Virtue::Undecided:
+                m_virtue = Virtue::Clean;
+                break;
+
+            default:
+                assertThrow(false, OptimizerException, "conflict: already tainted");
+                break;
+        }
+    }
+
+private:
+    Variable() = delete;
+
+    YulString m_name;
+    Virtue m_virtue;
+    bool m_protected;
+};
+
+class FunctionScope;
+
+class State
+{
+public:
+    static std::shared_ptr<State> make_shared(Dialect const& _dialect);
+
+    State() = delete;
+
+    Dialect const& dialect() { return m_dialect; }
+
+    FunctionScope const& function(YulString const& _name) const { return m_functions.at(_name); }
+    FunctionScope& function(YulString const& _name) { return m_functions.at(_name); }
+    FunctionScope& addFunction(FunctionScope scope);
+
+    Variable& addVariable(YulString _name);
+    void taintVariable(YulString const& _name);
+    void protectVariable(YulString const& _name);
+    void protectVariable(Expression const& _expr);
+    YulString duplicateVariable(YulString const& _name);
+    std::set<YulString> taintedVariables() const;
+
+	void enterAssignment(std::vector<YulString>);
+	void leaveAssignment(std::vector<YulString> const&);
+    std::vector<YulString> const& currentAssignment() const;
+
+    void dump() const;
+
+    void resolve();
+    void verify() const;
+
+private:
+    unsigned int m_rename;
+
+    Dialect const& m_dialect;
+    std::map<YulString, Variable> m_variables;
+    std::vector<YulString> m_current_assignment;
+    std::map<YulString, FunctionScope> m_functions;
+
+    explicit State(Dialect const&);
+};
+
+State::State(Dialect const& _dialect): m_rename(0), m_dialect(_dialect)
+{
+}
+
+std::set<YulString> State::taintedVariables() const
+{
+    std::set<YulString> tainted;
+
+    for (auto const& kv: m_variables)
+    {
+        if (kv.second.virtue() == Virtue::Tainted)
+        {
+            tainted.insert(kv.first);
+        }
+    }
+
+    return tainted;
+}
+
+YulString State::duplicateVariable(YulString const& _name)
+{
+    std::stringstream ss;
+    ss << _name.str() << "_" << m_rename;
+    YulString new_name = YulString(ss.str());
+
+    m_rename += 1;
+
+    addVariable(new_name) = m_variables.at(_name);
+
+    return new_name;
+}
+
+void State::taintVariable(YulString const& _name)
+{
+    m_variables.at(_name).setTainted();
+}
+
+void State::protectVariable(YulString const& _name)
+{
+    m_variables.at(_name).setProtected();
+}
+
+void State::protectVariable(Expression const& _expr)
+{
+    if (holds_alternative<Literal>(_expr)) return;
+    assertThrow(holds_alternative<Identifier>(_expr), OptimizerException, "untaintable non-ident");
+
+    Identifier const& ident = std::get<Identifier>(_expr);
+    protectVariable(ident.name);
+}
+
+Variable& State::addVariable(YulString _name)
+{
+    Variable var(_name);
+
+    auto result = m_variables.emplace(std::make_pair(_name, var));
+    assertThrow(result.second, OptimizerException, "duplicate variable");
+
+    return m_variables.at(_name);
+}
+
+void State::enterAssignment(std::vector<YulString> _vars)
+{
+    assertThrow(m_current_assignment.empty(), OptimizerException, "double assign");
+    m_current_assignment = _vars;
+}
+
+void State::leaveAssignment(std::vector<YulString> const& _vars)
+{
+    assertThrow(!m_current_assignment.empty(), OptimizerException, "missing assign");
+    assertThrow(_vars.size() == m_current_assignment.size(), OptimizerException, "mismatched assign");
+
+    m_current_assignment.clear();
+}
+
+std::vector<YulString> const& State::currentAssignment() const
+{
+    return m_current_assignment;
+}
+
+
+class FunctionScope
+{
+public:
+    explicit FunctionScope(std::weak_ptr<State> _state);
+    FunctionScope(std::weak_ptr<State> _state, FunctionDefinition const& _funDef);
+
+    YulString const& name() const { return m_name; }
+
+    void operator()(Assignment const& _assignment);
+    void operator()(VariableDeclaration const& _varDecl);
+    void operator()(FunctionCall const& _funCall);
+
+    void dump_state() const;
+
+    bool isResolved() const { return m_unresolved_calls.empty(); }
+    bool resolve();
+    void propagateTaint();
+
+private:
+    std::weak_ptr<State> m_state;
+    YulString m_name;
+
+    std::map<YulString, std::set<YulString>> m_data_flow;
+    std::vector<YulString> m_parameters;
+    std::vector<YulString> m_returns;
+
+    std::vector<CallSite> m_unresolved_calls;
+
+    FunctionScope() = delete;
+
+    void influences(YulString _upstream, YulString _downstream);
+	void influences(Expression const& _upstream, YulString _downstream);
+
+    void visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionForEVM const* _builtin);
+    void visitFunc(FunctionCall const&);
+
+    void embed(FunctionScope const&, std::vector<std::optional<YulString>> const&, std::vector<YulString> const&);
+
+    std::set<YulString> findDownstream(YulString const& _source) const;
+};
+
+FunctionScope::FunctionScope(std::weak_ptr<State> _state)
+    : m_state(_state), m_name(MAIN)
+{
+
+}
+
+FunctionScope::FunctionScope(std::weak_ptr<State> _state, FunctionDefinition const& _funDef)
+    : m_state(_state), m_name(_funDef.name)
+{
+    std::shared_ptr<State> state(_state.lock());
+
+    for (TypedName const& tn: _funDef.parameters)
+    {
+        state->addVariable(tn.name);
+        m_parameters.emplace_back(tn.name);
+    }
+
+    for (TypedName const& tn: _funDef.returnVariables)
+    {
+        state->addVariable(tn.name);
+        m_returns.emplace_back(tn.name);
+    }
+}
+
+void FunctionScope::influences(YulString _upstream, YulString _downstream)
+{
+    m_data_flow[_upstream].emplace(_downstream);
+}
+
+void FunctionScope::influences(Expression const& _upstream, YulString _downstream)
+{
+    if (holds_alternative<Literal>(_upstream))
+    {
+        return;
+    }
+
+    assertThrow(holds_alternative<Identifier>(_upstream), OptimizerException, "upstream expr must be literal or identifier");
+    Identifier const& upstream_ident = std::get<Identifier>(_upstream);
+
+    influences(upstream_ident.name, _downstream);
+}
+
+void FunctionScope::operator()(Assignment const& _assignment)
+{
+    std::shared_ptr<State> state(m_state.lock());
+
+    if (holds_alternative<Identifier>(*_assignment.value))
+    {
+        assertThrow(
+            1 == _assignment.variableNames.size(),
+            OptimizerException,
+            "not enough variables to unpack (expected 1)"
+        );
+
+        Identifier const& ident = std::get<Identifier>(*_assignment.value);
+
+		influences(ident.name, _assignment.variableNames[0].name);
+	}
+	else if (holds_alternative<Literal>(*_assignment.value))
+    {
+        assertThrow(
+            1 == _assignment.variableNames.size(),
+            OptimizerException,
+            "not enough variables to unpack (expected 1)"
+        );
+
+        // TODO: Maybe setClean the variable
+    }
+    else if (holds_alternative<FunctionCall>(*_assignment.value))
+    {
+        FunctionCall const& call = std::get<FunctionCall>(*_assignment.value);
+
+        std::vector<YulString> vars;
+        for (Identifier const& ident: _assignment.variableNames)
+        {
+            vars.push_back(ident.name);
+        }
+
+        state->enterAssignment(vars);
+        (*this)(call);
+        state->leaveAssignment(vars);
+    }
+    else
+    {
+        assertThrow(false, OptimizerException, "unexpected assignment value");
+    }
+
+}
+
+void FunctionScope::operator()(VariableDeclaration const& _varDecl)
+{
+    std::shared_ptr<State> state(m_state.lock());
+
+    for (TypedName const& tn: _varDecl.variables)
+    {
+        state->addVariable(tn.name);
+    }
+
+    if (holds_alternative<Identifier>(*_varDecl.value))
+    {
+        assertThrow(
+            1 == _varDecl.variables.size(),
+            OptimizerException,
+            "not enough variables to unpack (expected 1)"
+        );
+
+        Identifier const& ident = std::get<Identifier>(*_varDecl.value);
+		influences(ident.name, _varDecl.variables[0].name);
+	}
+	else if (holds_alternative<Literal>(*_varDecl.value))
+    {
+        assertThrow(
+            1 == _varDecl.variables.size(),
+            OptimizerException,
+            "not enough variables to unpack (expected 1)"
+        );
+
+        // TODO: Possibly setClean on the variable.
+    }
+    else if (holds_alternative<FunctionCall>(*_varDecl.value))
+    {
+        FunctionCall const& call = std::get<FunctionCall>(*_varDecl.value);
+
+        std::vector<YulString> vars;
+        for (TypedName const& tn: _varDecl.variables)
+        {
+            vars.push_back(tn.name);
+        }
+
+        state->enterAssignment(vars);
+        (*this)(call);
+        state->leaveAssignment(vars);
+    }
+    else
+    {
+        assertThrow(false, OptimizerException, "unexpected declaration value");
+    }
+}
+
+void FunctionScope::operator()(FunctionCall const& _funCall)
+{
+    std::shared_ptr<State> state(m_state.lock());
+
+    if (EVMDialect const* dialect = dynamic_cast<EVMDialect const*>(&state->dialect()))
+    {
+        if (auto const* builtin = dialect->builtin(_funCall.functionName.name))
+        {
+            visitBuiltin(_funCall, builtin);
+        }
+        else
+        {
+            visitFunc(_funCall);
+        }
+    }
+    else
+    {
+        assertThrow(false, OptimizerException, "only EVM dialect is supported");
+    }
+}
+
+void FunctionScope::visitFunc(FunctionCall const& _funCall)
+{
+    std::shared_ptr<State> state(m_state.lock());
+    std::vector<std::optional<YulString>> args;
+
+    for (Expression const& expr: _funCall.arguments)
+    {
+        if (holds_alternative<Literal>(expr))
+        {
+            std::optional<YulString> empty;
+            args.push_back(empty);
+        }
+        else if (holds_alternative<Identifier>(expr))
+        {
+            Identifier const& ident = std::get<Identifier>(expr);
+            args.push_back(ident.name);
+        }
+        else
+        {
+            assertThrow(false, OptimizerException, "unexpected function argument");
+        }
+    }
+
+    CallSite cs;
+    cs.callee = _funCall.functionName.name;
+    cs.arguments = args;
+    cs.returns = state->currentAssignment();
+
+    m_unresolved_calls.push_back(cs);
+}
+
+void FunctionScope::visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionForEVM const* _builtin)
+{
+    if (!_builtin->instruction)
+    {
+        std::cout << "Builtin with no instruction: " << _funCall.functionName.name.str() << std::endl;
+        return;
+    }
+
+    std::shared_ptr<State> state(m_state.lock());
+    std::vector<YulString> const& returns = state->currentAssignment();
+
+    switch (*_builtin->instruction)
+    {
+        case evmasm::Instruction::STOP:
+            break;
+
+        case evmasm::Instruction::ADD:
+        case evmasm::Instruction::MUL:
+        case evmasm::Instruction::SUB:
+        case evmasm::Instruction::DIV:
+        case evmasm::Instruction::SDIV:
+        case evmasm::Instruction::MOD:
+        case evmasm::Instruction::SMOD:
+        case evmasm::Instruction::EXP:
+        case evmasm::Instruction::SIGNEXTEND:
+        case evmasm::Instruction::LT:
+        case evmasm::Instruction::GT:
+        case evmasm::Instruction::SLT:
+        case evmasm::Instruction::SGT:
+        case evmasm::Instruction::EQ:
+        case evmasm::Instruction::AND:
+        case evmasm::Instruction::OR:
+        case evmasm::Instruction::XOR:
+        case evmasm::Instruction::BYTE:
+        case evmasm::Instruction::SHL:
+        case evmasm::Instruction::SHR:
+        case evmasm::Instruction::SAR:
+            influences(_funCall.arguments.at(0), returns.at(0));
+            influences(_funCall.arguments.at(1), returns.at(0));
+            break;
+
+        case evmasm::Instruction::ADDMOD:
+        case evmasm::Instruction::MULMOD:
+            influences(_funCall.arguments.at(0), returns.at(0));
+            influences(_funCall.arguments.at(1), returns.at(0));
+            influences(_funCall.arguments.at(2), returns.at(0));
+            break;
+
+        case evmasm::Instruction::ISZERO:
+        case evmasm::Instruction::NOT:
+        case evmasm::Instruction::CALLDATALOAD:
+        case evmasm::Instruction::BLOCKHASH:
+            influences(_funCall.arguments.at(0), returns.at(0));
+            break;
+
+        case evmasm::Instruction::RETURN:
+        case evmasm::Instruction::CREATE:
+        case evmasm::Instruction::CREATE2:
+        case evmasm::Instruction::MLOAD:
+        case evmasm::Instruction::MSTORE:
+        case evmasm::Instruction::MSTORE8:
+        case evmasm::Instruction::RETURNDATACOPY:
+        case evmasm::Instruction::EXTCODECOPY:
+        case evmasm::Instruction::CODECOPY:
+        case evmasm::Instruction::CALLDATACOPY:
+        case evmasm::Instruction::KECCAK256:
+            std::cout
+                << "memory not supported ("
+                << _funCall.functionName.name.str()
+                << ")"
+                << std::endl;
+            break;
+
+        case evmasm::Instruction::ADDRESS:
+        case evmasm::Instruction::ORIGIN:
+        case evmasm::Instruction::CALLER:
+        case evmasm::Instruction::CALLVALUE:
+        case evmasm::Instruction::CODESIZE:
+        case evmasm::Instruction::GASPRICE:
+        case evmasm::Instruction::CHAINID:
+        case evmasm::Instruction::MSIZE:
+            // TODO: Possibly setClean on the return value
+            break;
+
+        case evmasm::Instruction::EXTCODEHASH:
+        case evmasm::Instruction::EXTCODESIZE:
+        case evmasm::Instruction::BALANCE:
+            state->taintVariable(returns.at(0));
+            state->protectVariable(_funCall.arguments.at(0));
+
+            influences(_funCall.arguments.at(0), returns.at(0));
+            break;
+
+        case evmasm::Instruction::GAS:
+        case evmasm::Instruction::RETURNDATASIZE:
+        case evmasm::Instruction::CALLDATASIZE:
+        case evmasm::Instruction::COINBASE:
+        case evmasm::Instruction::TIMESTAMP:
+        case evmasm::Instruction::NUMBER:
+        case evmasm::Instruction::DIFFICULTY:
+        case evmasm::Instruction::GASLIMIT:
+        case evmasm::Instruction::SELFBALANCE:
+            state->taintVariable(returns.at(0));
+            break;
+
+        case evmasm::Instruction::JUMPDEST:
+            break;
+
+        case evmasm::Instruction::SLOAD:
+            std::cout << "SLOAD tainting " << returns.at(0).str() << std::endl;
+            state->taintVariable(returns.at(0));
+            state->protectVariable(_funCall.arguments.at(0));
+            influences(_funCall.arguments.at(0), returns.at(0));
+            break;
+
+        case evmasm::Instruction::SSTORE:
+            state->protectVariable(_funCall.arguments.at(0));
+            break;
+
+        case evmasm::Instruction::JUMP:
+        case evmasm::Instruction::JUMPI:
+        case evmasm::Instruction::PC:
+            assertThrow(false, OptimizerException, "$pc access not supported");
+            break;
+
+        case evmasm::Instruction::POP:
+            std::cout << "pop?" << std::endl;
+            // TODO: Stack manipulation isn't supported.
+            break;
+
+        case evmasm::Instruction::PUSH1:
+        case evmasm::Instruction::PUSH2:
+        case evmasm::Instruction::PUSH3:
+        case evmasm::Instruction::PUSH4:
+        case evmasm::Instruction::PUSH5:
+        case evmasm::Instruction::PUSH6:
+        case evmasm::Instruction::PUSH7:
+        case evmasm::Instruction::PUSH8:
+        case evmasm::Instruction::PUSH9:
+        case evmasm::Instruction::PUSH10:
+        case evmasm::Instruction::PUSH11:
+        case evmasm::Instruction::PUSH12:
+        case evmasm::Instruction::PUSH13:
+        case evmasm::Instruction::PUSH14:
+        case evmasm::Instruction::PUSH15:
+        case evmasm::Instruction::PUSH16:
+        case evmasm::Instruction::PUSH17:
+        case evmasm::Instruction::PUSH18:
+        case evmasm::Instruction::PUSH19:
+        case evmasm::Instruction::PUSH20:
+        case evmasm::Instruction::PUSH21:
+        case evmasm::Instruction::PUSH22:
+        case evmasm::Instruction::PUSH23:
+        case evmasm::Instruction::PUSH24:
+        case evmasm::Instruction::PUSH25:
+        case evmasm::Instruction::PUSH26:
+        case evmasm::Instruction::PUSH27:
+        case evmasm::Instruction::PUSH28:
+        case evmasm::Instruction::PUSH29:
+        case evmasm::Instruction::PUSH30:
+        case evmasm::Instruction::PUSH31:
+        case evmasm::Instruction::PUSH32:
+
+        case evmasm::Instruction::DUP1:
+        case evmasm::Instruction::DUP2:
+        case evmasm::Instruction::DUP3:
+        case evmasm::Instruction::DUP4:
+        case evmasm::Instruction::DUP5:
+        case evmasm::Instruction::DUP6:
+        case evmasm::Instruction::DUP7:
+        case evmasm::Instruction::DUP8:
+        case evmasm::Instruction::DUP9:
+        case evmasm::Instruction::DUP10:
+        case evmasm::Instruction::DUP11:
+        case evmasm::Instruction::DUP12:
+        case evmasm::Instruction::DUP13:
+        case evmasm::Instruction::DUP14:
+        case evmasm::Instruction::DUP15:
+        case evmasm::Instruction::DUP16:
+
+        case evmasm::Instruction::SWAP1:
+        case evmasm::Instruction::SWAP2:
+        case evmasm::Instruction::SWAP3:
+        case evmasm::Instruction::SWAP4:
+        case evmasm::Instruction::SWAP5:
+        case evmasm::Instruction::SWAP6:
+        case evmasm::Instruction::SWAP7:
+        case evmasm::Instruction::SWAP8:
+        case evmasm::Instruction::SWAP9:
+        case evmasm::Instruction::SWAP10:
+        case evmasm::Instruction::SWAP11:
+        case evmasm::Instruction::SWAP12:
+        case evmasm::Instruction::SWAP13:
+        case evmasm::Instruction::SWAP14:
+        case evmasm::Instruction::SWAP15:
+        case evmasm::Instruction::SWAP16:
+            assertThrow(false, OptimizerException, "stack not implemented");
+            break;
+
+        case evmasm::Instruction::LOG0:
+        case evmasm::Instruction::LOG1:
+        case evmasm::Instruction::LOG2:
+        case evmasm::Instruction::LOG3:
+        case evmasm::Instruction::LOG4:
+            break;
+
+        case evmasm::Instruction::JUMPTO:
+        case evmasm::Instruction::JUMPIF:
+        case evmasm::Instruction::JUMPV:
+        case evmasm::Instruction::JUMPSUB:
+        case evmasm::Instruction::JUMPSUBV:
+        case evmasm::Instruction::BEGINSUB:
+        case evmasm::Instruction::BEGINDATA:
+        case evmasm::Instruction::RETURNSUB:
+        case evmasm::Instruction::PUTLOCAL:
+        case evmasm::Instruction::GETLOCAL:
+            assertThrow(false, OptimizerException, "unknown instruction");
+            break;
+
+        case evmasm::Instruction::CALL:
+        case evmasm::Instruction::STATICCALL:
+        case evmasm::Instruction::CALLCODE:
+        case evmasm::Instruction::DELEGATECALL:
+            state->taintVariable(returns.at(0));
+            break;
+
+        case evmasm::Instruction::REVERT:
+        case evmasm::Instruction::INVALID:
+        case evmasm::Instruction::SELFDESTRUCT:
+            break;
+    }
+}
+
+bool FunctionScope::resolve()
+{
+    std::shared_ptr<State> state(m_state.lock());
+
+    std::cout << "Resolving: " << m_name.str() << std::endl;
+
+    while (!m_unresolved_calls.empty())
+    {
+        CallSite const& cs = m_unresolved_calls.back();
+        FunctionScope const& callee = state->function(cs.callee);
+
+        if (!callee.isResolved())
+        {
+            std::cout << "\tFailed: " << cs.callee.str() << std::endl;
+
+            // Check if the callee function is fully resolved. If not, defer
+            // resolving this function.
+
+            // TODO: handle cycles in the call graph.
+            return false;
+        }
+
+        embed(callee, cs.arguments, cs.returns);
+
+        m_unresolved_calls.pop_back();
+    }
+
+    return true;
+}
+
+void FunctionScope::embed(FunctionScope const& _callee, std::vector<std::optional<YulString>> const& _args, std::vector<YulString> const& _returns)
+{
+    std::shared_ptr<State> state(m_state.lock());
+
+    std::map<YulString, YulString> renames;
+
+    // Rename parameters and influence them from the arguments.
+    for (size_t ii = 0; ii < _callee.m_parameters.size(); ii++)
+    {
+        YulString const& param = _callee.m_parameters[ii];
+
+        YulString new_name = state->duplicateVariable(param);
+        auto ins = renames.emplace(std::make_pair(param, new_name));
+        assertThrow(ins.second, OptimizerException, "duplicate rename");
+
+        if (!_args.at(ii).has_value()) continue;
+
+        YulString const& arg = *_args.at(ii);
+        influences(arg, new_name);
+    }
+
+    // Rename returns and influence them.
+    for (size_t ii = 0; ii < _callee.m_returns.size(); ii++)
+    {
+        YulString const& ret_val = _callee.m_returns[ii];
+
+        YulString new_name = state->duplicateVariable(ret_val);
+        auto ins = renames.emplace(std::make_pair(ret_val, new_name));
+        assertThrow(ins.second, OptimizerException, "duplicate rename");
+
+        YulString const& ret_var = _returns.at(ii);
+        influences(new_name, ret_var);
+    }
+
+    // Rename and insert the rest of the variables.
+    for (auto const& kv: _callee.m_data_flow)
+    {
+        YulString new_key;
+        try
+        {
+            new_key = renames.at(kv.first);
+        }
+        catch (std::out_of_range const&)
+        {
+            new_key = state->duplicateVariable(kv.first);
+            renames[kv.first] = new_key;
+        }
+
+        for (YulString const& value: kv.second)
+        {
+            YulString new_value;
+            try
+            {
+                new_value = renames.at(value);
+            }
+            catch (std::out_of_range const&)
+            {
+                new_value = state->duplicateVariable(value);
+                renames[value] = new_value;
+            }
+
+            influences(new_key, new_value);
+        }
+    }
+}
+
+void FunctionScope::propagateTaint()
+{
+    std::shared_ptr<State> state(m_state.lock());
+    std::set<YulString> tainted = state->taintedVariables();
+
+    for (YulString const& t: tainted)
+    {
+        std::set<YulString> downstream = findDownstream(t);
+
+        for (YulString const& to_taint: downstream)
+        {
+            state->taintVariable(to_taint);
+        }
+    }
+}
+
+std::set<YulString> FunctionScope::findDownstream(YulString const& _source) const
+{
+    std::set<YulString> found;
+    found.insert(_source);
+
+    std::stack<YulString> to_explore;
+    to_explore.push(_source);
+
+    while (!to_explore.empty())
+    {
+        YulString top = to_explore.top();
+        to_explore.pop();
+
+        if (m_data_flow.end() == m_data_flow.find(top))
+            continue;
+
+        for (YulString const& name: m_data_flow.at(top))
+        {
+            if (found.insert(name).second)
+            {
+                to_explore.push(name);
+            }
+        }
+    }
+
+    return found;
+}
+
+void FunctionScope::dump_state() const
+{
+    std::cout << "\t" << m_name.str() << "(";
+
+    for (auto const& p: m_parameters)
+    {
+        std::cout << p.str() << ", ";
+    }
+
+    std::cout << ") -> ";
+
+    for (auto const& r: m_returns)
+    {
+        std::cout << r.str() << ", ";
+    }
+
+    std::cout << std::endl;
+
+    std::cout << "\t\tData Flow:" << std::endl;
+    std::cout
+        << "\t\t\t"
+        << std::left
+        << std::setw(20)
+        << "{upstream}"
+        << " -> {downstream}"
+        << std::endl
+        << std::endl;
+
+    for (auto const& kv: m_data_flow)
+    {
+        std::cout
+            << "\t\t\t"
+            << std::left
+            << std::setw(20)
+            << kv.first.str()
+            << " -> "
+            << std::flush;
+
+        for (YulString const& downstream: kv.second)
+        {
+            std::cout << downstream.str() << ", ";
+        }
+
+        std::cout << std::endl;
+    }
+
+
+    std::cout << "\t\tUnresolved Function Calls:" << std::endl;
+
+    for (auto const& cs: m_unresolved_calls)
+    {
+        std::cout
+            << "\t\t\t- "
+            << cs.callee.str()
+            << std::endl;
+    }
+}
+
+void State::verify() const
+{
+    for (auto const& kv: m_variables)
+    {
+        if (kv.second.isProtected() && kv.second.virtue() == Virtue::Tainted)
+        {
+            assertThrow(false, OptimizerException, "tainted variable used");
+        }
+    }
+}
+
+void State::resolve()
+{
+    std::deque<YulString> unresolved_functions;
+
+    for (auto const& kv: m_functions)
+    {
+        unresolved_functions.push_back(kv.first);
+    }
+
+    while (!unresolved_functions.empty())
+    {
+        YulString resolving = unresolved_functions.front();
+        unresolved_functions.pop_front();
+
+        FunctionScope& fn = m_functions.at(resolving);
+
+        if (!fn.resolve())
+        {
+            unresolved_functions.push_back(resolving);
+        }
+    }
+}
+
+void State::dump() const
+{
+    std::cout << "State:" << std::endl;
+
+    std::cout << "\tKnown Variables:" << std::endl;
+    for (auto const& kv: m_variables)
+    {
+        bool untaintable = kv.second.isProtected();
+
+        std::cout
+            << "\t\t"
+            << std::left
+            << std::setw(20)
+            << kv.first.str()
+            << " ["
+            << kv.second.virtue_str()
+            << "]";
+
+        if (untaintable)
+        {
+            std::cout << " [Untaintable]";
+        }
+
+        std::cout << std::endl;
+    }
+
+    std::cout << std::endl;
+    std::cout << "Functions:" << std::endl;
+
+    for (auto const& kv: m_functions)
+    {
+        kv.second.dump_state();
+        std::cout << std::endl;
+    }
+}
+FunctionScope& State::addFunction(FunctionScope scope)
+{
+    YulString name = scope.name();
+    m_functions.emplace(std::make_pair(name, scope));
+    return m_functions.at(name);
+}
+
+std::shared_ptr<State> State::make_shared(Dialect const& _dialect)
+{
+    shared_ptr<State> ptr = std::make_shared<State>(State(_dialect));
+
+    // Insert a function scope for code outside of functions.
+    FunctionScope main{std::weak_ptr(ptr)};
+    ptr->m_functions.emplace(std::make_pair(main.name(), main));
+
+    return ptr;
+}
+
+
+class StateDestroyer: public ASTWalker
+{
+public:
+    StateDestroyer() = delete;
+	explicit StateDestroyer(Dialect const& _dialect);
+
+    using ASTWalker::operator();
+
+    void operator()(FunctionDefinition const& _funDef) override;
+    void operator()(VariableDeclaration const& _varDef) override;
+    void operator()(Assignment const& _assignment) override;
+
+    void dump_state() const;
+
+    void resolve();
+
+    void propagateTaint();
+    void verify();
+
+private:
+    std::shared_ptr<State> m_state;
+    std::stack<FunctionScope> m_func_stack;
+
+    FunctionScope& currentScope();
+};
+
+StateDestroyer::StateDestroyer(Dialect const& _dialect)
+    : m_state(State::make_shared(_dialect))
+{
+}
+
+FunctionScope& StateDestroyer::currentScope()
+{
+    if (m_func_stack.empty())
+    {
+        return m_state->function(MAIN);
+    }
+    else
+    {
+        return m_func_stack.top();
+    }
+}
+
+void StateDestroyer::verify()
+{
+    m_state->verify();
+}
+
+void StateDestroyer::propagateTaint()
+{
+    FunctionScope& main = m_state->function(MAIN);
+    main.propagateTaint();
+}
+
+void StateDestroyer::resolve()
+{
+    m_state->resolve();
+}
+
+void StateDestroyer::operator()(FunctionDefinition const& _funDef)
+{
+    m_func_stack.emplace(m_state, _funDef);
+    (*this)(_funDef.body);
+
+    FunctionScope fn_scope = m_func_stack.top();
+    m_func_stack.pop();
+
+    assertThrow(_funDef.name == fn_scope.name(), OptimizerException, "mismatched func");
+    m_state->addFunction(fn_scope);
+}
+
+void StateDestroyer::operator()(Assignment const& _assignment)
+{
+    (currentScope())(_assignment);
+}
+
+void StateDestroyer::operator()(VariableDeclaration const& _varDef)
+{
+    (currentScope())(_varDef);
+}
+
+void StateDestroyer::dump_state() const
+{
+    m_state->dump();
+}
+
+// EVERYTHING BELOW HERE IS GARBAGE
+
+struct Function
+{
+    std::vector<YulString> parameters;
     std::vector<YulString> returns;
 };
 
@@ -268,69 +1292,6 @@ std::set<YulString> Scope::find_downstream(YulString const& source) const
     return found;
 }
 
-class Variable
-{
-public:
-    static Variable variable()
-    {
-        Variable v;
-        v.m_virtue = Virtue::Undecided;
-
-        return v;
-    }
-
-    static Variable parameter(YulString)
-    {
-        Variable v;
-        v.m_virtue = Virtue::Undecided;
-
-        return v;
-    }
-
-    Virtue virtue() const { return m_virtue; }
-    const char* virtue_str() const
-    {
-        switch (m_virtue)
-        {
-            case Virtue::Undecided:
-                return "Undecided";
-            case Virtue::Clean:
-                return "Clean";
-            case Virtue::MaybeTainted:
-                return "MaybeTainted";
-            case Virtue::Tainted:
-                return "Tainted";
-            default:
-                return "";
-        }
-    }
-
-
-    void set_tainted()
-    {
-        m_virtue = Virtue::Tainted;
-    }
-
-    void set_clean()
-    {
-        switch (m_virtue)
-        {
-            case Virtue::Clean:
-            case Virtue::Undecided:
-                m_virtue = Virtue::Clean;
-                break;
-
-            default:
-                assertThrow(false, OptimizerException, "conflict: already tainted");
-                break;
-        }
-    }
-
-private:
-    Variable() = default;
-
-    Virtue m_virtue;
-};
 
 class FunctionSensitivityAnalyzer: public ASTWalker
 {
@@ -461,7 +1422,7 @@ void FunctionSensitivityAnalyzer::taintScope(Scope const& scope)
 
         for (YulString const& downstream: all_downstream)
         {
-            m_variables.at(downstream).set_tainted();
+            m_variables.at(downstream).setTainted();
         }
     }
 }
@@ -725,7 +1686,7 @@ void FunctionSensitivityAnalyzer::enterBlock(BlockType type)
     YulString const& top = currentBlock().name();
     m_blocks.emplace(type);
     m_root_scope.influences(top, m_blocks.top().name());
-    addVariable(currentBlock().name(), Variable::variable());
+    addVariable(currentBlock().name(), Variable(currentBlock().name()));
 }
 
 void FunctionSensitivityAnalyzer::leaveBlock(BlockType type)
@@ -787,7 +1748,7 @@ void FunctionSensitivityAnalyzer::operator()(FunctionDefinition const& _funDef)
     for (TypedName const& tn: _funDef.parameters)
     {
         params.push_back(tn.name);
-        addVariable(tn.name, Variable::parameter(tn.name));
+        addVariable(tn.name, Variable(tn.name));
     }
 
     std::vector<YulString> returns;
@@ -795,7 +1756,7 @@ void FunctionSensitivityAnalyzer::operator()(FunctionDefinition const& _funDef)
     for (TypedName const& tn: _funDef.returnVariables)
     {
         returns.push_back(tn.name);
-        addVariable(tn.name, Variable::variable());
+        addVariable(tn.name, Variable(tn.name));
     }
 
     Function fn;
@@ -904,7 +1865,7 @@ void FunctionSensitivityAnalyzer::visitBuiltin(FunctionCall const& _funCall, Bui
         case evmasm::Instruction::GASPRICE:
         case evmasm::Instruction::CHAINID:
         case evmasm::Instruction::MSIZE:
-            m_variables.at(returns.at(0)).set_clean();
+            m_variables.at(returns.at(0)).setClean();
             break;
 
         case evmasm::Instruction::EXTCODEHASH:
@@ -1109,7 +2070,7 @@ void FunctionSensitivityAnalyzer::operator()(VariableDeclaration const& _variabl
 {
     for (TypedName const& tn: _variableDeclaration.variables)
     {
-        addVariable(tn.name, Variable::variable());
+        addVariable(tn.name, Variable(tn.name));
     }
 
 	auto const &cb = currentBlock();
@@ -1138,7 +2099,7 @@ void FunctionSensitivityAnalyzer::operator()(VariableDeclaration const& _variabl
             "not enough variables to unpack (expected 1)"
         );
 
-        m_variables.at(_variableDeclaration.variables[0].name).set_clean();
+        m_variables.at(_variableDeclaration.variables[0].name).setClean();
     }
     else if (holds_alternative<FunctionCall>(*_variableDeclaration.value))
     {
@@ -1188,7 +2149,7 @@ void FunctionSensitivityAnalyzer::operator()(Assignment const& _assignment)
             "not enough variables to unpack (expected 1)"
         );
 
-        m_variables.at(_assignment.variableNames[0].name).set_clean();
+        m_variables.at(_assignment.variableNames[0].name).setClean();
     }
     else if (holds_alternative<FunctionCall>(*_assignment.value))
     {
@@ -1214,10 +2175,10 @@ void OrderDependentStateDestroyer::run(OptimiserStepContext& _context, Block& _a
 {
     std::cout << yul::AsmPrinter()(_ast) << std::endl;
 
-    FunctionSensitivityAnalyzer fsa(_context.dialect);
-    (fsa)(_ast);
-    fsa.resolve();
-    fsa.taint();
-    fsa.dump_state();
-    fsa.verify();
+    StateDestroyer sd(_context.dialect);
+    (sd)(_ast);
+    sd.resolve();
+    sd.propagateTaint();
+    sd.dump_state();
+    sd.verify();
 }
