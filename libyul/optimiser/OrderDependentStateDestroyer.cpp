@@ -59,6 +59,42 @@ using namespace solidity::yul;
 
 static const YulString MAIN("!!main");
 
+enum class BlockType
+{
+    Root,
+    Function,
+    For,
+    If,
+};
+
+class TaintBlock
+{
+public:
+    TaintBlock() = delete;
+    explicit TaintBlock(BlockType bt);
+
+    BlockType type() const { return m_type; }
+    YulString const& name() const { return m_name; }
+
+private:
+    static unsigned int s_block_count;
+
+    YulString m_name;
+    BlockType m_type;
+    std::vector<YulString> m_conditions;
+};
+
+unsigned int TaintBlock::s_block_count;
+
+TaintBlock::TaintBlock(BlockType bt) : m_type(bt)
+{
+    std::stringstream ss;
+    ss << "!!block_" << s_block_count;
+    m_name = YulString(ss.str());
+
+    s_block_count += 1;
+}
+
 struct CallSite
 {
     YulString callee;
@@ -154,7 +190,11 @@ public:
     void dump() const;
 
     void resolve();
-    void verify() const;
+    std::optional<YulString> verify() const;
+
+	TaintBlock const& currentBlock() const { return m_blocks.top(); }
+	void enterBlock(BlockType type);
+	void leaveBlock(BlockType type);
 
 private:
     unsigned int m_rename;
@@ -163,12 +203,14 @@ private:
     std::map<YulString, Variable> m_variables;
     std::vector<YulString> m_current_assignment;
     std::map<YulString, FunctionScope> m_functions;
+    std::stack<TaintBlock> m_blocks;
 
     explicit State(Dialect const&);
 };
 
 State::State(Dialect const& _dialect): m_rename(0), m_dialect(_dialect)
 {
+    enterBlock(BlockType::Root);
 }
 
 std::set<YulString> State::taintedVariables() const
@@ -186,10 +228,22 @@ std::set<YulString> State::taintedVariables() const
     return tainted;
 }
 
+void State::enterBlock(BlockType _type)
+{
+    m_blocks.emplace(_type);
+    addVariable(currentBlock().name());
+}
+
+void State::leaveBlock(BlockType _type)
+{
+    assertThrow(m_blocks.top().type() == _type, OptimizerException, "mismatched block");
+    m_blocks.pop();
+}
+
 YulString State::duplicateVariable(YulString const& _name)
 {
     std::stringstream ss;
-    ss << _name.str() << "_" << m_rename;
+    ss << _name.str() << "_embed" << m_rename;
     YulString new_name = YulString(ss.str());
 
     m_rename += 1;
@@ -201,6 +255,7 @@ YulString State::duplicateVariable(YulString const& _name)
 
 void State::taintVariable(YulString const& _name)
 {
+    std::cout << "Tainting " << _name.str() << std::endl;
     m_variables.at(_name).setTainted();
 }
 
@@ -248,7 +303,7 @@ std::vector<YulString> const& State::currentAssignment() const
 }
 
 
-class FunctionScope
+class FunctionScope: public ASTWalker
 {
 public:
     explicit FunctionScope(std::weak_ptr<State> _state);
@@ -256,15 +311,20 @@ public:
 
     YulString const& name() const { return m_name; }
 
-    void operator()(Assignment const& _assignment);
-    void operator()(VariableDeclaration const& _varDecl);
-    void operator()(FunctionCall const& _funCall);
+    using ASTWalker::operator();
+
+    void operator()(Assignment const& _assignment) override;
+    void operator()(VariableDeclaration const& _varDecl) override;
+    void operator()(FunctionCall const& _funCall) override;
+    void operator()(If const& _if) override;
 
     void dump_state() const;
 
     bool isResolved() const { return m_unresolved_calls.empty(); }
     bool resolve();
     void propagateTaint();
+
+    std::vector<YulString> findPath(YulString const&, YulString const&) const;
 
 private:
     std::weak_ptr<State> m_state;
@@ -277,6 +337,9 @@ private:
     std::vector<CallSite> m_unresolved_calls;
 
     FunctionScope() = delete;
+
+	void enterBlock(BlockType type);
+	void leaveBlock(BlockType type);
 
     void influences(YulString _upstream, YulString _downstream);
 	void influences(Expression const& _upstream, YulString _downstream);
@@ -292,7 +355,23 @@ private:
 FunctionScope::FunctionScope(std::weak_ptr<State> _state)
     : m_state(_state), m_name(MAIN)
 {
+}
 
+void FunctionScope::enterBlock(BlockType _type)
+{
+    std::shared_ptr<State> state(m_state.lock());
+
+    YulString top = state->currentBlock().name();
+    state->enterBlock(_type);
+
+    YulString cur = state->currentBlock().name();
+    influences(top, cur);
+}
+
+void FunctionScope::leaveBlock(BlockType _type)
+{
+    std::shared_ptr<State> state(m_state.lock());
+    state->leaveBlock(_type);
 }
 
 FunctionScope::FunctionScope(std::weak_ptr<State> _state, FunctionDefinition const& _funDef)
@@ -331,9 +410,32 @@ void FunctionScope::influences(Expression const& _upstream, YulString _downstrea
     influences(upstream_ident.name, _downstream);
 }
 
+void FunctionScope::operator()(If const& _if)
+{
+    std::shared_ptr<State> state(m_state.lock());
+
+    const Expression& cond_expr = *_if.condition;
+    assertThrow(holds_alternative<Identifier>(cond_expr), OptimizerException, "if with non-identifier");
+
+    const Identifier& cond_ident = std::get<Identifier>(cond_expr);
+
+    enterBlock(BlockType::If);
+    influences(cond_ident.name, state->currentBlock().name());
+    std::cout << state->currentBlock().name().str() << " is if (" << cond_ident.name.str() << ")" << std::endl;
+
+    (*this)(_if.body);
+    leaveBlock(BlockType::If);
+}
+
 void FunctionScope::operator()(Assignment const& _assignment)
 {
     std::shared_ptr<State> state(m_state.lock());
+
+	auto const &cb = state->currentBlock();
+	for (Identifier const& v: _assignment.variableNames)
+    {
+        influences(cb.name(), v.name);
+    }
 
     if (holds_alternative<Identifier>(*_assignment.value))
     {
@@ -381,6 +483,12 @@ void FunctionScope::operator()(Assignment const& _assignment)
 void FunctionScope::operator()(VariableDeclaration const& _varDecl)
 {
     std::shared_ptr<State> state(m_state.lock());
+
+	auto const &cb = state->currentBlock();
+	for (TypedName const& tn: _varDecl.variables)
+    {
+        influences(cb.name(), tn.name);
+    }
 
     for (TypedName const& tn: _varDecl.variables)
     {
@@ -451,6 +559,8 @@ void FunctionScope::operator()(FunctionCall const& _funCall)
 
 void FunctionScope::visitFunc(FunctionCall const& _funCall)
 {
+    std::cout << "visitFunc " << _funCall.functionName.name.str() << std::endl;
+
     std::shared_ptr<State> state(m_state.lock());
     std::vector<std::optional<YulString>> args;
 
@@ -561,6 +671,7 @@ void FunctionScope::visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionFo
         case evmasm::Instruction::GASPRICE:
         case evmasm::Instruction::CHAINID:
         case evmasm::Instruction::MSIZE:
+        case evmasm::Instruction::CALLDATASIZE:
             // TODO: Possibly setClean on the return value
             break;
 
@@ -575,7 +686,6 @@ void FunctionScope::visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionFo
 
         case evmasm::Instruction::GAS:
         case evmasm::Instruction::RETURNDATASIZE:
-        case evmasm::Instruction::CALLDATASIZE:
         case evmasm::Instruction::COINBASE:
         case evmasm::Instruction::TIMESTAMP:
         case evmasm::Instruction::NUMBER:
@@ -745,6 +855,8 @@ bool FunctionScope::resolve()
 
 void FunctionScope::embed(FunctionScope const& _callee, std::vector<std::optional<YulString>> const& _args, std::vector<YulString> const& _returns)
 {
+    std::cout << "Embedding " << _callee.name().str() << " into " << m_name.str() << std::endl;
+
     std::shared_ptr<State> state(m_state.lock());
 
     std::map<YulString, YulString> renames;
@@ -853,6 +965,57 @@ std::set<YulString> FunctionScope::findDownstream(YulString const& _source) cons
     return found;
 }
 
+std::vector<YulString> FunctionScope::findPath(YulString const& _source, YulString const& _dest) const
+{
+    struct Foo
+    {
+        std::vector<YulString> path;
+        YulString next;
+    };
+
+    std::set<YulString> found;
+    found.insert(_source);
+
+    std::stack<Foo> to_explore;
+
+    Foo initial;
+    initial.next = _source;
+
+    to_explore.push(initial);
+
+    while (!to_explore.empty())
+    {
+        Foo top = to_explore.top();
+        to_explore.pop();
+
+        std::vector<YulString> path(top.path);
+        path.push_back(top.next);
+
+        if (m_data_flow.end() == m_data_flow.find(top.next))
+            continue;
+
+        for (YulString const& name: m_data_flow.at(top.next))
+        {
+            if (name == _dest)
+            {
+                return path;
+            }
+
+            if (found.insert(name).second)
+            {
+                Foo next;
+                next.next = name;
+                next.path = path;
+
+                to_explore.push(next);
+            }
+        }
+    }
+
+    std::vector<YulString> aoeu;
+    return aoeu;
+}
+
 void FunctionScope::dump_state() const
 {
     std::cout << "\t" << m_name.str() << "(";
@@ -911,15 +1074,17 @@ void FunctionScope::dump_state() const
     }
 }
 
-void State::verify() const
+std::optional<YulString> State::verify() const
 {
     for (auto const& kv: m_variables)
     {
         if (kv.second.isProtected() && kv.second.virtue() == Virtue::Tainted)
         {
-            assertThrow(false, OptimizerException, "tainted variable used");
+            return kv.first;
         }
     }
+
+    return std::optional<YulString>();
 }
 
 void State::resolve()
@@ -1008,21 +1173,23 @@ public:
     using ASTWalker::operator();
 
     void operator()(FunctionDefinition const& _funDef) override;
+    void operator()(FunctionCall const& _funCall) override;
     void operator()(VariableDeclaration const& _varDef) override;
     void operator()(Assignment const& _assignment) override;
+    void operator()(If const& _if) override;
 
     void dump_state() const;
 
     void resolve();
 
-    void propagateTaint();
-    void verify();
+    std::vector<YulString> verify();
 
 private:
     std::shared_ptr<State> m_state;
     std::stack<FunctionScope> m_func_stack;
 
     FunctionScope& currentScope();
+    void propagateTaint();
 };
 
 StateDestroyer::StateDestroyer(Dialect const& _dialect)
@@ -1042,9 +1209,31 @@ FunctionScope& StateDestroyer::currentScope()
     }
 }
 
-void StateDestroyer::verify()
+std::vector<YulString> StateDestroyer::verify()
 {
-    m_state->verify();
+    std::set<YulString> initially_tainted = m_state->taintedVariables();
+    propagateTaint();
+    std::optional<YulString> violation = m_state->verify();
+
+    if (!violation.has_value())
+    {
+        return std::vector<YulString>();
+    }
+
+    YulString untaintable = *violation;
+
+    FunctionScope& main = m_state->function(MAIN);
+
+    for (auto const& init: initially_tainted)
+    {
+        auto path = main.findPath(init, untaintable);
+        if (!path.empty())
+        {
+            return path;
+        }
+    }
+
+    assertThrow(false, OptimizerException, "unable to find path");
 }
 
 void StateDestroyer::propagateTaint()
@@ -1058,6 +1247,11 @@ void StateDestroyer::resolve()
     m_state->resolve();
 }
 
+void StateDestroyer::operator()(FunctionCall const& _funCall)
+{
+    (currentScope())(_funCall);
+}
+
 void StateDestroyer::operator()(FunctionDefinition const& _funDef)
 {
     m_func_stack.emplace(m_state, _funDef);
@@ -1068,6 +1262,11 @@ void StateDestroyer::operator()(FunctionDefinition const& _funDef)
 
     assertThrow(_funDef.name == fn_scope.name(), OptimizerException, "mismatched func");
     m_state->addFunction(fn_scope);
+}
+
+void StateDestroyer::operator()(If const& _if)
+{
+    (currentScope())(_if);
 }
 
 void StateDestroyer::operator()(Assignment const& _assignment)
@@ -1092,42 +1291,6 @@ struct Function
     std::vector<YulString> parameters;
     std::vector<YulString> returns;
 };
-
-enum class BlockType
-{
-    Root,
-    Function,
-    For,
-    If,
-};
-
-class TaintBlock
-{
-public:
-    TaintBlock() = delete;
-    explicit TaintBlock(BlockType bt);
-
-    BlockType type() const { return m_type; }
-    YulString const& name() const { return m_name; }
-
-private:
-    static unsigned int s_block_count;
-
-    YulString m_name;
-    BlockType m_type;
-    std::vector<YulString> m_conditions;
-};
-
-unsigned int TaintBlock::s_block_count;
-
-TaintBlock::TaintBlock(BlockType bt) : m_type(bt)
-{
-    std::stringstream ss;
-    ss << "!!block_" << s_block_count;
-    m_name = YulString(ss.str());
-
-    s_block_count += 1;
-}
 
 class Variable;
 
@@ -2007,6 +2170,7 @@ void FunctionSensitivityAnalyzer::visitBuiltin(FunctionCall const& _funCall, Bui
         case evmasm::Instruction::CALLCODE:
         case evmasm::Instruction::DELEGATECALL:
             taintVariable(returns.at(0));
+            assertThrow(false, OptimizerException, "calls not supported");
             break;
 
         case evmasm::Instruction::REVERT:
@@ -2178,7 +2342,22 @@ void OrderDependentStateDestroyer::run(OptimiserStepContext& _context, Block& _a
     StateDestroyer sd(_context.dialect);
     (sd)(_ast);
     sd.resolve();
-    sd.propagateTaint();
+
+    std::vector<YulString> violation = sd.verify();
     sd.dump_state();
-    sd.verify();
+
+    if (!violation.empty())
+    {
+        std::cout << "Taint violation:" << std::endl;
+        std::cout << "\t";
+
+        for (auto const& foo: violation)
+        {
+            std::cout << foo.str() << " -> ";
+        }
+
+        std::cout << std::endl;
+
+        assertThrow(false, OptimizerException, "Tainted variable used");
+    }
 }
