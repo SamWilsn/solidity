@@ -487,12 +487,8 @@ void FunctionScope::operator()(VariableDeclaration const& _varDecl)
 	auto const &cb = state->currentBlock();
 	for (TypedName const& tn: _varDecl.variables)
     {
-        influences(cb.name(), tn.name);
-    }
-
-    for (TypedName const& tn: _varDecl.variables)
-    {
         state->addVariable(tn.name);
+        influences(cb.name(), tn.name);
     }
 
     if (holds_alternative<Identifier>(*_varDecl.value))
