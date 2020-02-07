@@ -19,7 +19,9 @@
  */
 
 #include <libyul/AsmPrinter.h>
+#include "libsolutil/Common.h"
 #include "libyul/Dialect.h"
+#include "libyul/Utilities.h"
 #include "libyul/YulString.h"
 #include "libyul/backends/evm/EVMDialect.h"
 #include "libyul/optimiser/ASTWalker.h"
@@ -108,7 +110,7 @@ class Variable
 {
 public:
     Variable(YulString _name, Virtue _virtue = Virtue::Undecided):
-        m_name(_name), m_virtue(_virtue), m_protected(false) {}
+        m_name(_name), m_virtue(_virtue), m_protected(false), m_constant(true) {}
 
     Virtue virtue() const { return m_virtue; }
     const char* virtue_str() const
@@ -153,12 +155,43 @@ public:
         }
     }
 
+    bool isConstant() const { return m_constant; }
+    std::optional<u256> value() const { return m_value; }
+
+    void removeConstant()
+    {
+        m_constant = false;
+        m_value.reset();
+    }
+
+    void value(u256 _v)
+    {
+        if (!m_constant) return;
+
+        if (m_value.has_value())
+        {
+            if (_v == *m_value)
+            {
+                return;
+            }
+            else
+            {
+                removeConstant();
+            }
+        }
+
+        m_value = _v;
+    }
+
 private:
     Variable() = delete;
 
     YulString m_name;
     Virtue m_virtue;
     bool m_protected;
+
+    bool m_constant;
+    std::optional<u256> m_value;
 };
 
 class FunctionScope;
@@ -176,6 +209,8 @@ public:
     FunctionScope& function(YulString const& _name) { return m_functions.at(_name); }
     FunctionScope& addFunction(FunctionScope scope);
 
+    Variable const& variable(YulString const& _name) const { return m_variables.at(_name); }
+    Variable& variable(YulString const& _name) { return m_variables.at(_name); }
     Variable& addVariable(YulString _name);
     void taintVariable(YulString const& _name);
     void protectVariable(YulString const& _name);
@@ -341,6 +376,8 @@ private:
 	void enterBlock(BlockType type);
 	void leaveBlock(BlockType type);
 
+    void copyConstness(YulString _upstream, YulString _downstream);
+
     void influences(YulString _upstream, YulString _downstream);
 	void influences(Expression const& _upstream, YulString _downstream);
 
@@ -381,7 +418,7 @@ FunctionScope::FunctionScope(std::weak_ptr<State> _state, FunctionDefinition con
 
     for (TypedName const& tn: _funDef.parameters)
     {
-        state->addVariable(tn.name);
+        state->addVariable(tn.name).removeConstant();
         m_parameters.emplace_back(tn.name);
     }
 
@@ -389,6 +426,27 @@ FunctionScope::FunctionScope(std::weak_ptr<State> _state, FunctionDefinition con
     {
         state->addVariable(tn.name);
         m_returns.emplace_back(tn.name);
+    }
+}
+
+void FunctionScope::copyConstness(YulString _upstream, YulString _downstream)
+{
+    std::shared_ptr<State> state(m_state.lock());
+
+    Variable const& upvar = state->variable(_upstream);
+    Variable& downvar = state->variable(_downstream);
+
+    if (upvar.isConstant())
+    {
+        std::cout << _upstream.str() << std::endl;
+        assertThrow(upvar.value().has_value(), OptimizerException, "const without value");
+
+        u256 v = *upvar.value();
+        downvar.value(v);
+    }
+    else
+    {
+        downvar.removeConstant();
     }
 }
 
@@ -448,6 +506,7 @@ void FunctionScope::operator()(Assignment const& _assignment)
         Identifier const& ident = std::get<Identifier>(*_assignment.value);
 
 		influences(ident.name, _assignment.variableNames[0].name);
+		copyConstness(ident.name, _assignment.variableNames[0].name);
 	}
 	else if (holds_alternative<Literal>(*_assignment.value))
     {
@@ -458,6 +517,9 @@ void FunctionScope::operator()(Assignment const& _assignment)
         );
 
         // TODO: Maybe setClean the variable
+        Literal const& literal = std::get<Literal>(*_assignment.value);
+        u256 value = valueOfLiteral(literal);
+        state->variable(_assignment.variableNames.at(0).name).value(value);
     }
     else if (holds_alternative<FunctionCall>(*_assignment.value))
     {
@@ -466,6 +528,7 @@ void FunctionScope::operator()(Assignment const& _assignment)
         std::vector<YulString> vars;
         for (Identifier const& ident: _assignment.variableNames)
         {
+            state->variable(ident.name).removeConstant();
             vars.push_back(ident.name);
         }
 
@@ -501,6 +564,7 @@ void FunctionScope::operator()(VariableDeclaration const& _varDecl)
 
         Identifier const& ident = std::get<Identifier>(*_varDecl.value);
 		influences(ident.name, _varDecl.variables[0].name);
+		copyConstness(ident.name, _varDecl.variables[0].name);
 	}
 	else if (holds_alternative<Literal>(*_varDecl.value))
     {
@@ -511,6 +575,9 @@ void FunctionScope::operator()(VariableDeclaration const& _varDecl)
         );
 
         // TODO: Possibly setClean on the variable.
+        Literal const& literal = std::get<Literal>(*_varDecl.value);
+        u256 value = valueOfLiteral(literal);
+        state->variable(_varDecl.variables.at(0).name).value(value);
     }
     else if (holds_alternative<FunctionCall>(*_varDecl.value))
     {
@@ -519,6 +586,7 @@ void FunctionScope::operator()(VariableDeclaration const& _varDecl)
         std::vector<YulString> vars;
         for (TypedName const& tn: _varDecl.variables)
         {
+            state->variable(tn.name).removeConstant();
             vars.push_back(tn.name);
         }
 
@@ -1123,6 +1191,18 @@ void State::dump() const
             << " ["
             << kv.second.virtue_str()
             << "]";
+
+        if (kv.second.isConstant())
+        {
+            std::cout << " [constant";
+
+            if (kv.second.value().has_value())
+            {
+                std::cout << "=" << *kv.second.value();
+            }
+
+            std::cout << "]";
+        }
 
         if (untaintable)
         {
