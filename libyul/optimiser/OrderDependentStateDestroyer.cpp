@@ -60,6 +60,7 @@ using namespace solidity;
 using namespace solidity::yul;
 
 static const YulString MAIN("!!main");
+static const YulString MEMORY("!!memory");
 
 enum class BlockType
 {
@@ -194,6 +195,164 @@ private:
     std::optional<u256> m_value;
 };
 
+class TaintMemory
+{
+public:
+    TaintMemory(): m_counter(0), m_bytes() {}
+    YulString write(u256 _addr, u256 _len);
+    YulString write(const Variable& _var, const Variable& _len);
+    YulString write(const Variable& _var, u256 _len);
+
+    std::set<YulString> read(u256 _addr, u256 _len);
+    std::set<YulString> read(Variable const& _var, u256 _len);
+    std::set<YulString> read(Variable const& _var, const Variable& _len);
+
+    void clear() { m_bytes.clear(); }
+
+private:
+    unsigned int m_counter;
+    std::map<u256, YulString> m_bytes;
+
+    YulString newVariable();
+};
+
+YulString TaintMemory::newVariable()
+{
+    unsigned int c = m_counter;
+    m_counter += 1;
+
+    std::stringstream ss;
+    ss << "!!m" << c;
+
+    return YulString(ss.str());
+}
+
+std::set<YulString> TaintMemory::read(Variable const& _addr, Variable const& _len)
+{
+
+    if (_len.isConstant())
+    {
+        assertThrow(_len.value().has_value(), OptimizerException, "length constant has no value");
+
+        return read(_addr, *_len.value());
+    }
+    else
+    {
+        u256 addr = 0;
+
+        if (_addr.isConstant() && _addr.value().has_value())
+        {
+            addr = *_addr.value();
+        }
+
+        std::set<YulString> vars;
+        vars.insert(MEMORY);
+
+        for (auto const& kv: m_bytes)
+        {
+            if (kv.first >= addr)
+            {
+                vars.insert(kv.second);
+            }
+        }
+
+        return vars;
+    }
+
+}
+
+std::set<YulString> TaintMemory::read(Variable const& _addr, u256 _len)
+{
+    if (_addr.isConstant())
+    {
+        assertThrow(_addr.value().has_value(), OptimizerException, "address constant has no value");
+
+        return read(*_addr.value(), _len);
+    }
+    else
+    {
+        std::set<YulString> vars;
+        vars.insert(MEMORY);
+
+        for (auto const& kv: m_bytes)
+        {
+            vars.insert(kv.second);
+        }
+
+        return vars;
+    }
+}
+
+std::set<YulString> TaintMemory::read(u256 _addr, u256 _len)
+{
+    std::cout << "Memory Read at " << _addr << " (" << _len << " bytes)" << std::endl;
+
+    std::set<YulString> vars;
+
+    for (u256 ii = 0; ii < _len; ii++)
+    {
+        YulString name;
+        try
+        {
+            name = m_bytes.at(ii + _addr);
+        }
+        catch (std::out_of_range const&)
+        {
+            name = MEMORY;
+        }
+
+        vars.insert(name);
+    }
+
+    return vars;
+}
+
+YulString TaintMemory::write(const Variable& _addr, const Variable& _len)
+{
+    u256 length;
+
+    if (_len.isConstant())
+    {
+        assertThrow(_len.value().has_value(), OptimizerException, "length constant has no value");
+        return write(_addr, *_len.value());
+    }
+    else
+    {
+        // TODO: This can technically only affect keys >= _addr
+        m_bytes.clear();
+        return MEMORY;
+    }
+}
+
+YulString TaintMemory::write(const Variable& _addr, u256 _len)
+{
+    if (_addr.isConstant())
+    {
+        assertThrow(_addr.value().has_value(), OptimizerException, "address constant has no value");
+        return write(*_addr.value(), _len);
+    }
+    else
+    {
+        m_bytes.clear();
+        return MEMORY;
+    }
+}
+
+YulString TaintMemory::write(u256 _addr, u256 _len)
+{
+    std::cout << "Memory write to " << _addr << " (" << _len << " bytes)" << std::endl;
+
+    YulString name(newVariable());
+
+    for (u256 ii = 0; ii < _len; ii++)
+    {
+        m_bytes[ii + _addr] = name;
+    }
+
+    return name;
+}
+
+
 class FunctionScope;
 
 class State
@@ -211,7 +370,7 @@ public:
 
     Variable const& variable(YulString const& _name) const { return m_variables.at(_name); }
     Variable& variable(YulString const& _name) { return m_variables.at(_name); }
-    Variable& addVariable(YulString _name);
+    Variable& addVariable(YulString _name, bool _allowDuplicate = false);
     void taintVariable(YulString const& _name);
     void protectVariable(YulString const& _name);
     void protectVariable(Expression const& _expr);
@@ -231,6 +390,9 @@ public:
 	void enterBlock(BlockType type);
 	void leaveBlock(BlockType type);
 
+	TaintMemory const& memory() const { return m_memory; }
+	TaintMemory& memory() { return m_memory; }
+
 private:
     unsigned int m_rename;
 
@@ -239,6 +401,7 @@ private:
     std::vector<YulString> m_current_assignment;
     std::map<YulString, FunctionScope> m_functions;
     std::stack<TaintBlock> m_blocks;
+    TaintMemory m_memory;
 
     explicit State(Dialect const&);
 };
@@ -277,6 +440,8 @@ void State::leaveBlock(BlockType _type)
 
 YulString State::duplicateVariable(YulString const& _name)
 {
+    if (_name == MEMORY) return MEMORY;
+
     std::stringstream ss;
     ss << _name.str() << "_embed" << m_rename;
     YulString new_name = YulString(ss.str());
@@ -308,12 +473,12 @@ void State::protectVariable(Expression const& _expr)
     protectVariable(ident.name);
 }
 
-Variable& State::addVariable(YulString _name)
+Variable& State::addVariable(YulString _name, bool _allowDuplicate)
 {
     Variable var(_name);
 
     auto result = m_variables.emplace(std::make_pair(_name, var));
-    assertThrow(result.second, OptimizerException, "duplicate variable");
+    assertThrow(_allowDuplicate || result.second, OptimizerException, "duplicate variable");
 
     return m_variables.at(_name);
 }
@@ -383,6 +548,9 @@ private:
 
     void visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionForEVM const* _builtin);
     void visitFunc(FunctionCall const&);
+    void visitMLoad(FunctionCall const& _funCall);
+    void visitMStore(FunctionCall const& _funCall);
+    void visitKeccak256(FunctionCall const& _funCall);
 
     void embed(FunctionScope const&, std::vector<std::optional<YulString>> const&, std::vector<YulString> const&);
 
@@ -415,6 +583,8 @@ FunctionScope::FunctionScope(std::weak_ptr<State> _state, FunctionDefinition con
     : m_state(_state), m_name(_funDef.name)
 {
     std::shared_ptr<State> state(_state.lock());
+
+    state->memory().clear();
 
     for (TypedName const& tn: _funDef.parameters)
     {
@@ -654,6 +824,73 @@ void FunctionScope::visitFunc(FunctionCall const& _funCall)
     m_unresolved_calls.push_back(cs);
 }
 
+void FunctionScope::visitKeccak256(FunctionCall const& _funCall)
+{
+    std::shared_ptr<State> state(m_state.lock());
+    std::vector<YulString> const& returns = state->currentAssignment();
+
+    Expression const& addr_expr = _funCall.arguments.at(0);
+    assertThrow(holds_alternative<Identifier>(addr_expr), OptimizerException, "non-ident");
+
+    Identifier const& addr_ident = std::get<Identifier>(addr_expr);
+    Variable const& addr_var = state->variable(addr_ident.name);
+
+    Expression const& len_expr = _funCall.arguments.at(1);
+    Identifier const& len_ident = std::get<Identifier>(len_expr);
+    Variable const& len_var = state->variable(len_ident.name);
+
+    std::set<YulString> mlocs = state->memory().read(addr_var, len_var);
+
+    for (auto const& mloc: mlocs)
+    {
+        state->addVariable(mloc, true);
+        influences(mloc, returns.at(0));
+    }
+
+    // TODO: Copy constness
+}
+
+void FunctionScope::visitMStore(FunctionCall const& _funCall)
+{
+    std::shared_ptr<State> state(m_state.lock());
+
+    Expression const& addr_expr = _funCall.arguments.at(0);
+    assertThrow(holds_alternative<Identifier>(addr_expr), OptimizerException, "non-ident");
+
+    Identifier const& addr_ident = std::get<Identifier>(addr_expr);
+    Variable const& addr_var = state->variable(addr_ident.name);
+
+    Expression const& val_expr = _funCall.arguments.at(1);
+
+    YulString mloc = state->memory().write(addr_var, 32);
+    state->addVariable(mloc, true);
+    influences(val_expr, mloc);
+
+    std::cout << "mstore: " << mloc.str() << std::endl;
+
+    // TODO: Copy constness from val_expr to mloc
+}
+
+void FunctionScope::visitMLoad(FunctionCall const& _funCall)
+{
+    std::shared_ptr<State> state(m_state.lock());
+    std::vector<YulString> const& returns = state->currentAssignment();
+
+    Expression const& addr_expr = _funCall.arguments.at(0);
+    assertThrow(holds_alternative<Identifier>(addr_expr), OptimizerException, "non-ident");
+
+    Identifier const& addr_ident = std::get<Identifier>(addr_expr);
+    Variable const& addr_var = state->variable(addr_ident.name);
+
+    std::set<YulString> mlocs = state->memory().read(addr_var, 32);
+
+    for (auto const& mloc: mlocs)
+    {
+        state->addVariable(mloc, true);
+        influences(mloc, returns.at(0));
+    }
+}
+
 void FunctionScope::visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionForEVM const* _builtin)
 {
     if (!_builtin->instruction)
@@ -709,17 +946,26 @@ void FunctionScope::visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionFo
             influences(_funCall.arguments.at(0), returns.at(0));
             break;
 
+        case evmasm::Instruction::MLOAD:
+            visitMLoad(_funCall);
+            break;
+
+        case evmasm::Instruction::MSTORE:
+            visitMStore(_funCall);
+            break;
+
+        case evmasm::Instruction::KECCAK256:
+            visitKeccak256(_funCall);
+            break;
+
+        case evmasm::Instruction::MSTORE8:
         case evmasm::Instruction::RETURN:
         case evmasm::Instruction::CREATE:
         case evmasm::Instruction::CREATE2:
-        case evmasm::Instruction::MLOAD:
-        case evmasm::Instruction::MSTORE:
-        case evmasm::Instruction::MSTORE8:
         case evmasm::Instruction::RETURNDATACOPY:
         case evmasm::Instruction::EXTCODECOPY:
         case evmasm::Instruction::CODECOPY:
         case evmasm::Instruction::CALLDATACOPY:
-        case evmasm::Instruction::KECCAK256:
             std::cout
                 << "memory not supported ("
                 << _funCall.functionName.name.str()
