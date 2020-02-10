@@ -517,6 +517,7 @@ public:
     void operator()(VariableDeclaration const& _varDecl) override;
     void operator()(FunctionCall const& _funCall) override;
     void operator()(If const& _if) override;
+    void operator()(Switch const& _switch) override;
 
     void dump_state() const;
 
@@ -636,6 +637,28 @@ void FunctionScope::influences(Expression const& _upstream, YulString _downstrea
     Identifier const& upstream_ident = std::get<Identifier>(_upstream);
 
     influences(upstream_ident.name, _downstream);
+}
+
+void FunctionScope::operator()(Switch const& _switch)
+{
+    std::shared_ptr<State> state(m_state.lock());
+
+    const Expression& cond_expr = *_switch.expression;
+    assertThrow(holds_alternative<Identifier>(cond_expr), OptimizerException, "switch with non-identifier");
+
+    const Identifier& cond_ident = std::get<Identifier>(cond_expr);
+
+    enterBlock(BlockType::If);
+    influences(cond_ident.name, state->currentBlock().name());
+    std::cout << state->currentBlock().name().str() << " is switch (" << cond_ident.name.str() << ")" << std::endl;
+
+    for (auto const& _case: _switch.cases)
+    {
+        if (_case.value)
+            (*this)(*_case.value);
+        (*this)(_case.body);
+    }
+    leaveBlock(BlockType::If);
 }
 
 void FunctionScope::operator()(If const& _if)
@@ -1499,6 +1522,7 @@ public:
     void operator()(VariableDeclaration const& _varDef) override;
     void operator()(Assignment const& _assignment) override;
     void operator()(If const& _if) override;
+    void operator()(Switch const& _switch) override;
 
     void dump_state() const;
 
@@ -1584,6 +1608,11 @@ void StateDestroyer::operator()(FunctionDefinition const& _funDef)
 
     assertThrow(_funDef.name == fn_scope.name(), OptimizerException, "mismatched func");
     m_state->addFunction(fn_scope);
+}
+
+void StateDestroyer::operator()(Switch const& _switch)
+{
+    (currentScope())(_switch);
 }
 
 void StateDestroyer::operator()(If const& _if)
