@@ -1,18 +1,18 @@
 /*
-	This file is part of solidity.
+    This file is part of solidity.
 
-	solidity is free software: you can redistribute it and/or modify
-	it under the terms of the GNU General Public License as published by
-	the Free Software Foundation, either version 3 of the License, or
-	(at your option) any later version.
+    solidity is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
 
-	solidity is distributed in the hope that it will be useful,
-	but WITHOUT ANY WARRANTY; without even the implied warranty of
-	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-	GNU General Public License for more details.
+    solidity is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
 
-	You should have received a copy of the GNU General Public License
-	along with solidity.  If not, see <http://www.gnu.org/licenses/>.
+    You should have received a copy of the GNU General Public License
+    along with solidity.  If not, see <http://www.gnu.org/licenses/>.
 */
 /**
  * Optimiser component that destroys order-dependent state accesses.
@@ -377,8 +377,8 @@ public:
     YulString duplicateVariable(YulString const& _name);
     std::set<YulString> taintedVariables() const;
 
-	void enterAssignment(std::vector<YulString>);
-	void leaveAssignment(std::vector<YulString> const&);
+    void enterAssignment(std::vector<YulString>);
+    void leaveAssignment(std::vector<YulString> const&);
     std::vector<YulString> const& currentAssignment() const;
 
     void dump() const;
@@ -386,12 +386,13 @@ public:
     void resolve();
     std::optional<YulString> verify() const;
 
-	TaintBlock const& currentBlock() const { return m_blocks.top(); }
-	void enterBlock(BlockType type);
-	void leaveBlock(BlockType type);
+    TaintBlock const& currentBlock() const { return m_blocks.back(); }
+    void enterBlock(BlockType type);
+    void leaveBlock(BlockType type);
+    TaintBlock const& findBlock(BlockType type);
 
-	TaintMemory const& memory() const { return m_memory; }
-	TaintMemory& memory() { return m_memory; }
+    TaintMemory const& memory() const { return m_memory; }
+    TaintMemory& memory() { return m_memory; }
 
 private:
     unsigned int m_rename;
@@ -400,7 +401,7 @@ private:
     std::map<YulString, Variable> m_variables;
     std::vector<YulString> m_current_assignment;
     std::map<YulString, FunctionScope> m_functions;
-    std::stack<TaintBlock> m_blocks;
+    std::vector<TaintBlock> m_blocks;
     TaintMemory m_memory;
 
     explicit State(Dialect const&);
@@ -426,16 +427,30 @@ std::set<YulString> State::taintedVariables() const
     return tainted;
 }
 
+TaintBlock const& State::findBlock(BlockType type)
+{
+    for (auto it = m_blocks.rbegin(); it != m_blocks.rend(); it++)
+    {
+        TaintBlock const& block = *it;
+        if (block.type() == type)
+        {
+            return block;
+        }
+    }
+
+    assertThrow(false, OptimizerException, "no block found");
+}
+
 void State::enterBlock(BlockType _type)
 {
-    m_blocks.emplace(_type);
+    m_blocks.emplace_back(_type);
     addVariable(currentBlock().name());
 }
 
 void State::leaveBlock(BlockType _type)
 {
-    assertThrow(m_blocks.top().type() == _type, OptimizerException, "mismatched block");
-    m_blocks.pop();
+    assertThrow(m_blocks.back().type() == _type, OptimizerException, "mismatched block");
+    m_blocks.pop_back();
 }
 
 YulString State::duplicateVariable(YulString const& _name)
@@ -518,6 +533,9 @@ public:
     void operator()(FunctionCall const& _funCall) override;
     void operator()(If const& _if) override;
     void operator()(Switch const& _switch) override;
+    void operator()(ForLoop const& _for) override;
+    void operator()(Break const&) override;
+    void operator()(Continue const& _continue) override;
 
     void dump_state() const;
 
@@ -539,13 +557,13 @@ private:
 
     FunctionScope() = delete;
 
-	void enterBlock(BlockType type);
-	void leaveBlock(BlockType type);
+    void enterBlock(BlockType type);
+    void leaveBlock(BlockType type);
 
     void copyConstness(YulString _upstream, YulString _downstream);
 
     void influences(YulString _upstream, YulString _downstream);
-	void influences(Expression const& _upstream, YulString _downstream);
+    void influences(Expression const& _upstream, YulString _downstream);
 
     void visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionForEVM const* _builtin);
     void visitFunc(FunctionCall const&);
@@ -682,8 +700,8 @@ void FunctionScope::operator()(Assignment const& _assignment)
 {
     std::shared_ptr<State> state(m_state.lock());
 
-	auto const &cb = state->currentBlock();
-	for (Identifier const& v: _assignment.variableNames)
+    auto const &cb = state->currentBlock();
+    for (Identifier const& v: _assignment.variableNames)
     {
         influences(cb.name(), v.name);
     }
@@ -698,10 +716,10 @@ void FunctionScope::operator()(Assignment const& _assignment)
 
         Identifier const& ident = std::get<Identifier>(*_assignment.value);
 
-		influences(ident.name, _assignment.variableNames[0].name);
-		copyConstness(ident.name, _assignment.variableNames[0].name);
-	}
-	else if (holds_alternative<Literal>(*_assignment.value))
+        influences(ident.name, _assignment.variableNames[0].name);
+        copyConstness(ident.name, _assignment.variableNames[0].name);
+    }
+    else if (holds_alternative<Literal>(*_assignment.value))
     {
         assertThrow(
             1 == _assignment.variableNames.size(),
@@ -740,8 +758,8 @@ void FunctionScope::operator()(VariableDeclaration const& _varDecl)
 {
     std::shared_ptr<State> state(m_state.lock());
 
-	auto const &cb = state->currentBlock();
-	for (TypedName const& tn: _varDecl.variables)
+    auto const &cb = state->currentBlock();
+    for (TypedName const& tn: _varDecl.variables)
     {
         state->addVariable(tn.name);
         influences(cb.name(), tn.name);
@@ -756,10 +774,10 @@ void FunctionScope::operator()(VariableDeclaration const& _varDecl)
         );
 
         Identifier const& ident = std::get<Identifier>(*_varDecl.value);
-		influences(ident.name, _varDecl.variables[0].name);
-		copyConstness(ident.name, _varDecl.variables[0].name);
-	}
-	else if (holds_alternative<Literal>(*_varDecl.value))
+        influences(ident.name, _varDecl.variables[0].name);
+        copyConstness(ident.name, _varDecl.variables[0].name);
+    }
+    else if (holds_alternative<Literal>(*_varDecl.value))
     {
         assertThrow(
             1 == _varDecl.variables.size(),
@@ -791,6 +809,40 @@ void FunctionScope::operator()(VariableDeclaration const& _varDecl)
     {
         assertThrow(false, OptimizerException, "unexpected declaration value");
     }
+}
+
+void FunctionScope::operator()(ForLoop const& _for)
+{
+    assertThrow(holds_alternative<Literal>(*_for.condition), OptimizerException, "bad for");
+
+    enterBlock(BlockType::For);
+
+    (*this)(_for.pre);
+    visit(*_for.condition);
+    (*this)(_for.body);
+    (*this)(_for.post);
+
+    leaveBlock(BlockType::For);
+}
+
+void FunctionScope::operator()(Continue const&)
+{
+    std::shared_ptr<State> state(m_state.lock());
+
+    TaintBlock const& loop = state->findBlock(BlockType::For);
+    TaintBlock const& current = state->currentBlock();
+
+    influences(current.name(), loop.name());
+}
+
+void FunctionScope::operator()(Break const&)
+{
+    std::shared_ptr<State> state(m_state.lock());
+
+    TaintBlock const& loop = state->findBlock(BlockType::For);
+    TaintBlock const& current = state->currentBlock();
+
+    influences(current.name(), loop.name());
 }
 
 void FunctionScope::operator()(FunctionCall const& _funCall)
@@ -1490,6 +1542,7 @@ void State::dump() const
         std::cout << std::endl;
     }
 }
+
 FunctionScope& State::addFunction(FunctionScope scope)
 {
     YulString name = scope.name();
@@ -1513,7 +1566,7 @@ class StateDestroyer: public ASTWalker
 {
 public:
     StateDestroyer() = delete;
-	explicit StateDestroyer(Dialect const& _dialect);
+    explicit StateDestroyer(Dialect const& _dialect);
 
     using ASTWalker::operator();
 
@@ -1523,6 +1576,9 @@ public:
     void operator()(Assignment const& _assignment) override;
     void operator()(If const& _if) override;
     void operator()(Switch const& _switch) override;
+    void operator()(ForLoop const& _for) override;
+    void operator()(Break const&) override;
+    void operator()(Continue const&) override;
 
     void dump_state() const;
 
@@ -1608,6 +1664,21 @@ void StateDestroyer::operator()(FunctionDefinition const& _funDef)
 
     assertThrow(_funDef.name == fn_scope.name(), OptimizerException, "mismatched func");
     m_state->addFunction(fn_scope);
+}
+
+void StateDestroyer::operator()(Continue const& _continue)
+{
+    (currentScope())(_continue);
+}
+
+void StateDestroyer::operator()(Break const& _break)
+{
+    (currentScope())(_break);
+}
+
+void StateDestroyer::operator()(ForLoop const& _for)
+{
+    (currentScope())(_for);
 }
 
 void StateDestroyer::operator()(Switch const& _switch)
