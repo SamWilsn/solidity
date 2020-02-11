@@ -131,7 +131,6 @@ void OptimiserSuite::run(
 				RedundantAssignEliminator::name,
 				OrderDependentStateDestroyer::name,
 			}, ast);
-			cout << yul::AsmPrinter()(ast) << endl;
 			/*
 				ExpressionSimplifier::name,
 				CommonSubexpressionEliminator::name,
