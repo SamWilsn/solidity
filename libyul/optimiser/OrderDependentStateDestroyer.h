@@ -32,14 +32,14 @@
 #include <tuple>
 #include <vector>
 
-namespace solidity::yul
+namespace yul
 {
 
 class OrderDependentStateDestroyer
 {
 public:
 	static constexpr char const* name{"OrderDependentStateDestroyer"};
-	static void run(OptimiserStepContext&, Block& _ast);
+	static void run(::yul::OptimiserStepContext&, ::yul::Block& _ast);
 
 	OrderDependentStateDestroyer() = default;
 	OrderDependentStateDestroyer(OrderDependentStateDestroyer const&) = delete;

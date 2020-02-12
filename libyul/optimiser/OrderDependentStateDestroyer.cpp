@@ -19,7 +19,7 @@
  */
 
 #include <libyul/AsmPrinter.h>
-#include "libsolutil/Common.h"
+#include "libdevcore/Common.h"
 #include "libyul/Dialect.h"
 #include "libyul/Utilities.h"
 #include "libyul/YulString.h"
@@ -34,13 +34,10 @@
 #include <iterator>
 #include <libevmasm/Instruction.h>
 #include <libyul/Exceptions.h>
-#include <libsolutil/Assertions.h>
 #include <libyul/AsmDataForward.h>
 #include <libyul/optimiser/OrderDependentStateDestroyer.h>
 #include <libyul/optimiser/Semantics.h>
 #include <libyul/AsmData.h>
-
-#include <libsolutil/CommonData.h>
 
 #include <boost/range/algorithm_ext/erase.hpp>
 #include <map>
@@ -56,8 +53,10 @@
 #include <vector>
 
 using namespace std;
-using namespace solidity;
-using namespace solidity::yul;
+
+using namespace ::yul;
+
+using ::dev::u256;
 
 static const YulString MAIN("!!main");
 static const YulString MEMORY("!!memory");
@@ -813,9 +812,20 @@ void FunctionScope::operator()(VariableDeclaration const& _varDecl)
 
 void FunctionScope::operator()(ForLoop const& _for)
 {
-    assertThrow(holds_alternative<Literal>(*_for.condition), OptimizerException, "bad for");
-
     enterBlock(BlockType::For);
+
+    if (holds_alternative<Identifier>(*_for.condition))
+    {
+        std::shared_ptr<State> state(m_state.lock());
+
+        Identifier const& cond_ident = std::get<Identifier>(*_for.condition);
+        influences(cond_ident.name, state->currentBlock().name());
+    }
+    else
+    {
+        assertThrow(holds_alternative<Literal>(*_for.condition), OptimizerException, "bad for");
+    }
+
 
     (*this)(_for.pre);
     visit(*_for.condition);
@@ -979,68 +989,68 @@ void FunctionScope::visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionFo
 
     switch (*_builtin->instruction)
     {
-        case evmasm::Instruction::STOP:
+        case dev::eth::Instruction::STOP:
             break;
 
-        case evmasm::Instruction::ADD:
-        case evmasm::Instruction::MUL:
-        case evmasm::Instruction::SUB:
-        case evmasm::Instruction::DIV:
-        case evmasm::Instruction::SDIV:
-        case evmasm::Instruction::MOD:
-        case evmasm::Instruction::SMOD:
-        case evmasm::Instruction::EXP:
-        case evmasm::Instruction::SIGNEXTEND:
-        case evmasm::Instruction::LT:
-        case evmasm::Instruction::GT:
-        case evmasm::Instruction::SLT:
-        case evmasm::Instruction::SGT:
-        case evmasm::Instruction::EQ:
-        case evmasm::Instruction::AND:
-        case evmasm::Instruction::OR:
-        case evmasm::Instruction::XOR:
-        case evmasm::Instruction::BYTE:
-        case evmasm::Instruction::SHL:
-        case evmasm::Instruction::SHR:
-        case evmasm::Instruction::SAR:
+        case dev::eth::Instruction::ADD:
+        case dev::eth::Instruction::MUL:
+        case dev::eth::Instruction::SUB:
+        case dev::eth::Instruction::DIV:
+        case dev::eth::Instruction::SDIV:
+        case dev::eth::Instruction::MOD:
+        case dev::eth::Instruction::SMOD:
+        case dev::eth::Instruction::EXP:
+        case dev::eth::Instruction::SIGNEXTEND:
+        case dev::eth::Instruction::LT:
+        case dev::eth::Instruction::GT:
+        case dev::eth::Instruction::SLT:
+        case dev::eth::Instruction::SGT:
+        case dev::eth::Instruction::EQ:
+        case dev::eth::Instruction::AND:
+        case dev::eth::Instruction::OR:
+        case dev::eth::Instruction::XOR:
+        case dev::eth::Instruction::BYTE:
+        case dev::eth::Instruction::SHL:
+        case dev::eth::Instruction::SHR:
+        case dev::eth::Instruction::SAR:
             influences(_funCall.arguments.at(0), returns.at(0));
             influences(_funCall.arguments.at(1), returns.at(0));
             break;
 
-        case evmasm::Instruction::ADDMOD:
-        case evmasm::Instruction::MULMOD:
+        case dev::eth::Instruction::ADDMOD:
+        case dev::eth::Instruction::MULMOD:
             influences(_funCall.arguments.at(0), returns.at(0));
             influences(_funCall.arguments.at(1), returns.at(0));
             influences(_funCall.arguments.at(2), returns.at(0));
             break;
 
-        case evmasm::Instruction::ISZERO:
-        case evmasm::Instruction::NOT:
-        case evmasm::Instruction::CALLDATALOAD:
-        case evmasm::Instruction::BLOCKHASH:
+        case dev::eth::Instruction::ISZERO:
+        case dev::eth::Instruction::NOT:
+        case dev::eth::Instruction::CALLDATALOAD:
+        case dev::eth::Instruction::BLOCKHASH:
             influences(_funCall.arguments.at(0), returns.at(0));
             break;
 
-        case evmasm::Instruction::MLOAD:
+        case dev::eth::Instruction::MLOAD:
             visitMLoad(_funCall);
             break;
 
-        case evmasm::Instruction::MSTORE:
+        case dev::eth::Instruction::MSTORE:
             visitMStore(_funCall);
             break;
 
-        case evmasm::Instruction::KECCAK256:
+        case dev::eth::Instruction::KECCAK256:
             visitKeccak256(_funCall);
             break;
 
-        case evmasm::Instruction::MSTORE8:
-        case evmasm::Instruction::RETURN:
-        case evmasm::Instruction::CREATE:
-        case evmasm::Instruction::CREATE2:
-        case evmasm::Instruction::RETURNDATACOPY:
-        case evmasm::Instruction::EXTCODECOPY:
-        case evmasm::Instruction::CODECOPY:
-        case evmasm::Instruction::CALLDATACOPY:
+        case dev::eth::Instruction::MSTORE8:
+        case dev::eth::Instruction::RETURN:
+        case dev::eth::Instruction::CREATE:
+        case dev::eth::Instruction::CREATE2:
+        case dev::eth::Instruction::RETURNDATACOPY:
+        case dev::eth::Instruction::EXTCODECOPY:
+        case dev::eth::Instruction::CODECOPY:
+        case dev::eth::Instruction::CALLDATACOPY:
             std::cout
                 << "memory not supported ("
                 << _funCall.functionName.name.str()
@@ -1048,162 +1058,162 @@ void FunctionScope::visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionFo
                 << std::endl;
             break;
 
-        case evmasm::Instruction::ADDRESS:
-        case evmasm::Instruction::ORIGIN:
-        case evmasm::Instruction::CALLER:
-        case evmasm::Instruction::CALLVALUE:
-        case evmasm::Instruction::CODESIZE:
-        case evmasm::Instruction::GASPRICE:
-        case evmasm::Instruction::CHAINID:
-        case evmasm::Instruction::MSIZE:
-        case evmasm::Instruction::CALLDATASIZE:
+        case dev::eth::Instruction::ADDRESS:
+        case dev::eth::Instruction::ORIGIN:
+        case dev::eth::Instruction::CALLER:
+        case dev::eth::Instruction::CALLVALUE:
+        case dev::eth::Instruction::CODESIZE:
+        case dev::eth::Instruction::GASPRICE:
+        case dev::eth::Instruction::CHAINID:
+        case dev::eth::Instruction::MSIZE:
+        case dev::eth::Instruction::CALLDATASIZE:
             // TODO: Possibly setClean on the return value
             break;
 
-        case evmasm::Instruction::EXTCODEHASH:
-        case evmasm::Instruction::EXTCODESIZE:
-        case evmasm::Instruction::BALANCE:
+        case dev::eth::Instruction::EXTCODEHASH:
+        case dev::eth::Instruction::EXTCODESIZE:
+        case dev::eth::Instruction::BALANCE:
             state->taintVariable(returns.at(0));
             state->protectVariable(_funCall.arguments.at(0));
 
             influences(_funCall.arguments.at(0), returns.at(0));
             break;
 
-        case evmasm::Instruction::GAS:
-        case evmasm::Instruction::RETURNDATASIZE:
-        case evmasm::Instruction::COINBASE:
-        case evmasm::Instruction::TIMESTAMP:
-        case evmasm::Instruction::NUMBER:
-        case evmasm::Instruction::DIFFICULTY:
-        case evmasm::Instruction::GASLIMIT:
-        case evmasm::Instruction::SELFBALANCE:
+        case dev::eth::Instruction::GAS:
+        case dev::eth::Instruction::RETURNDATASIZE:
+        case dev::eth::Instruction::COINBASE:
+        case dev::eth::Instruction::TIMESTAMP:
+        case dev::eth::Instruction::NUMBER:
+        case dev::eth::Instruction::DIFFICULTY:
+        case dev::eth::Instruction::GASLIMIT:
+        case dev::eth::Instruction::SELFBALANCE:
             state->taintVariable(returns.at(0));
             break;
 
-        case evmasm::Instruction::JUMPDEST:
+        case dev::eth::Instruction::JUMPDEST:
             break;
 
-        case evmasm::Instruction::SLOAD:
+        case dev::eth::Instruction::SLOAD:
             std::cout << "SLOAD tainting " << returns.at(0).str() << std::endl;
             state->taintVariable(returns.at(0));
             state->protectVariable(_funCall.arguments.at(0));
             influences(_funCall.arguments.at(0), returns.at(0));
             break;
 
-        case evmasm::Instruction::SSTORE:
+        case dev::eth::Instruction::SSTORE:
             state->protectVariable(_funCall.arguments.at(0));
             break;
 
-        case evmasm::Instruction::JUMP:
-        case evmasm::Instruction::JUMPI:
-        case evmasm::Instruction::PC:
+        case dev::eth::Instruction::JUMP:
+        case dev::eth::Instruction::JUMPI:
+        case dev::eth::Instruction::PC:
             assertThrow(false, OptimizerException, "$pc access not supported");
             break;
 
-        case evmasm::Instruction::POP:
+        case dev::eth::Instruction::POP:
             std::cout << "pop?" << std::endl;
             // TODO: Stack manipulation isn't supported.
             break;
 
-        case evmasm::Instruction::PUSH1:
-        case evmasm::Instruction::PUSH2:
-        case evmasm::Instruction::PUSH3:
-        case evmasm::Instruction::PUSH4:
-        case evmasm::Instruction::PUSH5:
-        case evmasm::Instruction::PUSH6:
-        case evmasm::Instruction::PUSH7:
-        case evmasm::Instruction::PUSH8:
-        case evmasm::Instruction::PUSH9:
-        case evmasm::Instruction::PUSH10:
-        case evmasm::Instruction::PUSH11:
-        case evmasm::Instruction::PUSH12:
-        case evmasm::Instruction::PUSH13:
-        case evmasm::Instruction::PUSH14:
-        case evmasm::Instruction::PUSH15:
-        case evmasm::Instruction::PUSH16:
-        case evmasm::Instruction::PUSH17:
-        case evmasm::Instruction::PUSH18:
-        case evmasm::Instruction::PUSH19:
-        case evmasm::Instruction::PUSH20:
-        case evmasm::Instruction::PUSH21:
-        case evmasm::Instruction::PUSH22:
-        case evmasm::Instruction::PUSH23:
-        case evmasm::Instruction::PUSH24:
-        case evmasm::Instruction::PUSH25:
-        case evmasm::Instruction::PUSH26:
-        case evmasm::Instruction::PUSH27:
-        case evmasm::Instruction::PUSH28:
-        case evmasm::Instruction::PUSH29:
-        case evmasm::Instruction::PUSH30:
-        case evmasm::Instruction::PUSH31:
-        case evmasm::Instruction::PUSH32:
+        case dev::eth::Instruction::PUSH1:
+        case dev::eth::Instruction::PUSH2:
+        case dev::eth::Instruction::PUSH3:
+        case dev::eth::Instruction::PUSH4:
+        case dev::eth::Instruction::PUSH5:
+        case dev::eth::Instruction::PUSH6:
+        case dev::eth::Instruction::PUSH7:
+        case dev::eth::Instruction::PUSH8:
+        case dev::eth::Instruction::PUSH9:
+        case dev::eth::Instruction::PUSH10:
+        case dev::eth::Instruction::PUSH11:
+        case dev::eth::Instruction::PUSH12:
+        case dev::eth::Instruction::PUSH13:
+        case dev::eth::Instruction::PUSH14:
+        case dev::eth::Instruction::PUSH15:
+        case dev::eth::Instruction::PUSH16:
+        case dev::eth::Instruction::PUSH17:
+        case dev::eth::Instruction::PUSH18:
+        case dev::eth::Instruction::PUSH19:
+        case dev::eth::Instruction::PUSH20:
+        case dev::eth::Instruction::PUSH21:
+        case dev::eth::Instruction::PUSH22:
+        case dev::eth::Instruction::PUSH23:
+        case dev::eth::Instruction::PUSH24:
+        case dev::eth::Instruction::PUSH25:
+        case dev::eth::Instruction::PUSH26:
+        case dev::eth::Instruction::PUSH27:
+        case dev::eth::Instruction::PUSH28:
+        case dev::eth::Instruction::PUSH29:
+        case dev::eth::Instruction::PUSH30:
+        case dev::eth::Instruction::PUSH31:
+        case dev::eth::Instruction::PUSH32:
 
-        case evmasm::Instruction::DUP1:
-        case evmasm::Instruction::DUP2:
-        case evmasm::Instruction::DUP3:
-        case evmasm::Instruction::DUP4:
-        case evmasm::Instruction::DUP5:
-        case evmasm::Instruction::DUP6:
-        case evmasm::Instruction::DUP7:
-        case evmasm::Instruction::DUP8:
-        case evmasm::Instruction::DUP9:
-        case evmasm::Instruction::DUP10:
-        case evmasm::Instruction::DUP11:
-        case evmasm::Instruction::DUP12:
-        case evmasm::Instruction::DUP13:
-        case evmasm::Instruction::DUP14:
-        case evmasm::Instruction::DUP15:
-        case evmasm::Instruction::DUP16:
+        case dev::eth::Instruction::DUP1:
+        case dev::eth::Instruction::DUP2:
+        case dev::eth::Instruction::DUP3:
+        case dev::eth::Instruction::DUP4:
+        case dev::eth::Instruction::DUP5:
+        case dev::eth::Instruction::DUP6:
+        case dev::eth::Instruction::DUP7:
+        case dev::eth::Instruction::DUP8:
+        case dev::eth::Instruction::DUP9:
+        case dev::eth::Instruction::DUP10:
+        case dev::eth::Instruction::DUP11:
+        case dev::eth::Instruction::DUP12:
+        case dev::eth::Instruction::DUP13:
+        case dev::eth::Instruction::DUP14:
+        case dev::eth::Instruction::DUP15:
+        case dev::eth::Instruction::DUP16:
 
-        case evmasm::Instruction::SWAP1:
-        case evmasm::Instruction::SWAP2:
-        case evmasm::Instruction::SWAP3:
-        case evmasm::Instruction::SWAP4:
-        case evmasm::Instruction::SWAP5:
-        case evmasm::Instruction::SWAP6:
-        case evmasm::Instruction::SWAP7:
-        case evmasm::Instruction::SWAP8:
-        case evmasm::Instruction::SWAP9:
-        case evmasm::Instruction::SWAP10:
-        case evmasm::Instruction::SWAP11:
-        case evmasm::Instruction::SWAP12:
-        case evmasm::Instruction::SWAP13:
-        case evmasm::Instruction::SWAP14:
-        case evmasm::Instruction::SWAP15:
-        case evmasm::Instruction::SWAP16:
+        case dev::eth::Instruction::SWAP1:
+        case dev::eth::Instruction::SWAP2:
+        case dev::eth::Instruction::SWAP3:
+        case dev::eth::Instruction::SWAP4:
+        case dev::eth::Instruction::SWAP5:
+        case dev::eth::Instruction::SWAP6:
+        case dev::eth::Instruction::SWAP7:
+        case dev::eth::Instruction::SWAP8:
+        case dev::eth::Instruction::SWAP9:
+        case dev::eth::Instruction::SWAP10:
+        case dev::eth::Instruction::SWAP11:
+        case dev::eth::Instruction::SWAP12:
+        case dev::eth::Instruction::SWAP13:
+        case dev::eth::Instruction::SWAP14:
+        case dev::eth::Instruction::SWAP15:
+        case dev::eth::Instruction::SWAP16:
             assertThrow(false, OptimizerException, "stack not implemented");
             break;
 
-        case evmasm::Instruction::LOG0:
-        case evmasm::Instruction::LOG1:
-        case evmasm::Instruction::LOG2:
-        case evmasm::Instruction::LOG3:
-        case evmasm::Instruction::LOG4:
+        case dev::eth::Instruction::LOG0:
+        case dev::eth::Instruction::LOG1:
+        case dev::eth::Instruction::LOG2:
+        case dev::eth::Instruction::LOG3:
+        case dev::eth::Instruction::LOG4:
             break;
 
-        case evmasm::Instruction::JUMPTO:
-        case evmasm::Instruction::JUMPIF:
-        case evmasm::Instruction::JUMPV:
-        case evmasm::Instruction::JUMPSUB:
-        case evmasm::Instruction::JUMPSUBV:
-        case evmasm::Instruction::BEGINSUB:
-        case evmasm::Instruction::BEGINDATA:
-        case evmasm::Instruction::RETURNSUB:
-        case evmasm::Instruction::PUTLOCAL:
-        case evmasm::Instruction::GETLOCAL:
+        case dev::eth::Instruction::JUMPTO:
+        case dev::eth::Instruction::JUMPIF:
+        case dev::eth::Instruction::JUMPV:
+        case dev::eth::Instruction::JUMPSUB:
+        case dev::eth::Instruction::JUMPSUBV:
+        case dev::eth::Instruction::BEGINSUB:
+        case dev::eth::Instruction::BEGINDATA:
+        case dev::eth::Instruction::RETURNSUB:
+        case dev::eth::Instruction::PUTLOCAL:
+        case dev::eth::Instruction::GETLOCAL:
             assertThrow(false, OptimizerException, "unknown instruction");
             break;
 
-        case evmasm::Instruction::CALL:
-        case evmasm::Instruction::STATICCALL:
-        case evmasm::Instruction::CALLCODE:
-        case evmasm::Instruction::DELEGATECALL:
+        case dev::eth::Instruction::CALL:
+        case dev::eth::Instruction::STATICCALL:
+        case dev::eth::Instruction::CALLCODE:
+        case dev::eth::Instruction::DELEGATECALL:
             state->taintVariable(returns.at(0));
             break;
 
-        case evmasm::Instruction::REVERT:
-        case evmasm::Instruction::INVALID:
-        case evmasm::Instruction::SELFDESTRUCT:
+        case dev::eth::Instruction::REVERT:
+        case dev::eth::Instruction::INVALID:
+        case dev::eth::Instruction::SELFDESTRUCT:
             break;
     }
 }
@@ -1708,7 +1718,7 @@ void StateDestroyer::dump_state() const
 
 void OrderDependentStateDestroyer::run(OptimiserStepContext& _context, Block& _ast)
 {
-    std::cout << yul::AsmPrinter()(_ast) << std::endl;
+    std::cout << AsmPrinter()(_ast) << std::endl;
 
     StateDestroyer sd(_context.dialect);
     (sd)(_ast);
