@@ -47,6 +47,7 @@
 #include <set>
 #include <stack>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -383,7 +384,7 @@ public:
     void dump() const;
 
     void resolve();
-    std::optional<YulString> verify() const;
+    std::set<YulString> verify() const;
 
     TaintBlock const& currentBlock() const { return m_blocks.back(); }
     void enterBlock(BlockType type);
@@ -469,7 +470,6 @@ YulString State::duplicateVariable(YulString const& _name)
 
 void State::taintVariable(YulString const& _name)
 {
-    std::cout << "Tainting " << _name.str() << std::endl;
     m_variables.at(_name).setTainted();
 }
 
@@ -535,6 +535,7 @@ public:
     void operator()(ForLoop const& _for) override;
     void operator()(Break const&) override;
     void operator()(Continue const& _continue) override;
+    void operator()(FunctionalInstruction const& _instr) override;
 
     void dump_state() const;
 
@@ -564,11 +565,12 @@ private:
     void influences(YulString _upstream, YulString _downstream);
     void influences(Expression const& _upstream, YulString _downstream);
 
+    void visitInstruction(dev::eth::Instruction const& _inst, std::vector<Expression> const& _args);
     void visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionForEVM const* _builtin);
     void visitFunc(FunctionCall const&);
-    void visitMLoad(FunctionCall const& _funCall);
-    void visitMStore(FunctionCall const& _funCall);
-    void visitKeccak256(FunctionCall const& _funCall);
+    void visitMLoad(std::vector<Expression> const& _args);
+    void visitMStore(std::vector<Expression> const& _args);
+    void visitKeccak256(std::vector<Expression> const& _args);
 
     void embed(FunctionScope const&, std::vector<std::optional<YulString>> const&, std::vector<YulString> const&);
 
@@ -621,16 +623,23 @@ void FunctionScope::copyConstness(YulString _upstream, YulString _downstream)
 {
     std::shared_ptr<State> state(m_state.lock());
 
-    Variable const& upvar = state->variable(_upstream);
+    Variable& upvar = state->variable(_upstream);
     Variable& downvar = state->variable(_downstream);
 
     if (upvar.isConstant())
     {
-        std::cout << _upstream.str() << std::endl;
-        assertThrow(upvar.value().has_value(), OptimizerException, "const without value");
+        if (upvar.value().has_value())
+        {
+            u256 v = *upvar.value();
+            downvar.value(v);
+        }
+        else
+        {
+            std::cout << "Removing const from " << _upstream.str() << std::endl;
+            upvar.removeConstant();
+            downvar.removeConstant();
+        }
 
-        u256 v = *upvar.value();
-        downvar.value(v);
     }
     else
     {
@@ -746,6 +755,21 @@ void FunctionScope::operator()(Assignment const& _assignment)
         (*this)(call);
         state->leaveAssignment(vars);
     }
+    else if (holds_alternative<FunctionalInstruction>(*_assignment.value))
+    {
+        FunctionalInstruction const& fi = std::get<FunctionalInstruction>(*_assignment.value);
+
+        std::vector<YulString> vars;
+        for (Identifier const& ident: _assignment.variableNames)
+        {
+            state->variable(ident.name).removeConstant();
+            vars.push_back(ident.name);
+        }
+
+        state->enterAssignment(vars);
+        (*this)(fi);
+        state->leaveAssignment(vars);
+    }
     else
     {
         assertThrow(false, OptimizerException, "unexpected assignment value");
@@ -802,6 +826,21 @@ void FunctionScope::operator()(VariableDeclaration const& _varDecl)
 
         state->enterAssignment(vars);
         (*this)(call);
+        state->leaveAssignment(vars);
+    }
+    else if (holds_alternative<FunctionalInstruction>(*_varDecl.value))
+    {
+        FunctionalInstruction const& fi = std::get<FunctionalInstruction>(*_varDecl.value);
+
+        std::vector<YulString> vars;
+        for (TypedName const& tn: _varDecl.variables)
+        {
+            state->variable(tn.name).removeConstant();
+            vars.push_back(tn.name);
+        }
+
+        state->enterAssignment(vars);
+        (*this)(fi);
         state->leaveAssignment(vars);
     }
     else
@@ -878,8 +917,6 @@ void FunctionScope::operator()(FunctionCall const& _funCall)
 
 void FunctionScope::visitFunc(FunctionCall const& _funCall)
 {
-    std::cout << "visitFunc " << _funCall.functionName.name.str() << std::endl;
-
     std::shared_ptr<State> state(m_state.lock());
     std::vector<std::optional<YulString>> args;
 
@@ -909,18 +946,18 @@ void FunctionScope::visitFunc(FunctionCall const& _funCall)
     m_unresolved_calls.push_back(cs);
 }
 
-void FunctionScope::visitKeccak256(FunctionCall const& _funCall)
+void FunctionScope::visitKeccak256(std::vector<Expression> const& _args)
 {
     std::shared_ptr<State> state(m_state.lock());
     std::vector<YulString> const& returns = state->currentAssignment();
 
-    Expression const& addr_expr = _funCall.arguments.at(0);
+    Expression const& addr_expr = _args.at(0);
     assertThrow(holds_alternative<Identifier>(addr_expr), OptimizerException, "non-ident");
 
     Identifier const& addr_ident = std::get<Identifier>(addr_expr);
     Variable const& addr_var = state->variable(addr_ident.name);
 
-    Expression const& len_expr = _funCall.arguments.at(1);
+    Expression const& len_expr = _args.at(1);
     Identifier const& len_ident = std::get<Identifier>(len_expr);
     Variable const& len_var = state->variable(len_ident.name);
 
@@ -935,17 +972,17 @@ void FunctionScope::visitKeccak256(FunctionCall const& _funCall)
     // TODO: Copy constness
 }
 
-void FunctionScope::visitMStore(FunctionCall const& _funCall)
+void FunctionScope::visitMStore(std::vector<Expression> const& _args)
 {
     std::shared_ptr<State> state(m_state.lock());
 
-    Expression const& addr_expr = _funCall.arguments.at(0);
+    Expression const& addr_expr = _args.at(0);
     assertThrow(holds_alternative<Identifier>(addr_expr), OptimizerException, "non-ident");
 
     Identifier const& addr_ident = std::get<Identifier>(addr_expr);
     Variable const& addr_var = state->variable(addr_ident.name);
 
-    Expression const& val_expr = _funCall.arguments.at(1);
+    Expression const& val_expr = _args.at(1);
 
     YulString mloc = state->memory().write(addr_var, 32);
     state->addVariable(mloc, true);
@@ -956,12 +993,12 @@ void FunctionScope::visitMStore(FunctionCall const& _funCall)
     // TODO: Copy constness from val_expr to mloc
 }
 
-void FunctionScope::visitMLoad(FunctionCall const& _funCall)
+void FunctionScope::visitMLoad(std::vector<Expression> const& _args)
 {
     std::shared_ptr<State> state(m_state.lock());
     std::vector<YulString> const& returns = state->currentAssignment();
 
-    Expression const& addr_expr = _funCall.arguments.at(0);
+    Expression const& addr_expr = _args.at(0);
     assertThrow(holds_alternative<Identifier>(addr_expr), OptimizerException, "non-ident");
 
     Identifier const& addr_ident = std::get<Identifier>(addr_expr);
@@ -984,10 +1021,20 @@ void FunctionScope::visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionFo
         return;
     }
 
+    visitInstruction(*_builtin->instruction, _funCall.arguments);
+}
+
+void FunctionScope::operator()(FunctionalInstruction const& _instr)
+{
+    visitInstruction(_instr.instruction, _instr.arguments);
+}
+
+void FunctionScope::visitInstruction(dev::eth::Instruction const& _inst, std::vector<Expression> const& _args)
+{
     std::shared_ptr<State> state(m_state.lock());
     std::vector<YulString> const& returns = state->currentAssignment();
 
-    switch (*_builtin->instruction)
+    switch (_inst)
     {
         case dev::eth::Instruction::STOP:
             break;
@@ -1013,34 +1060,34 @@ void FunctionScope::visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionFo
         case dev::eth::Instruction::SHL:
         case dev::eth::Instruction::SHR:
         case dev::eth::Instruction::SAR:
-            influences(_funCall.arguments.at(0), returns.at(0));
-            influences(_funCall.arguments.at(1), returns.at(0));
+            influences(_args.at(0), returns.at(0));
+            influences(_args.at(1), returns.at(0));
             break;
 
         case dev::eth::Instruction::ADDMOD:
         case dev::eth::Instruction::MULMOD:
-            influences(_funCall.arguments.at(0), returns.at(0));
-            influences(_funCall.arguments.at(1), returns.at(0));
-            influences(_funCall.arguments.at(2), returns.at(0));
+            influences(_args.at(0), returns.at(0));
+            influences(_args.at(1), returns.at(0));
+            influences(_args.at(2), returns.at(0));
             break;
 
         case dev::eth::Instruction::ISZERO:
         case dev::eth::Instruction::NOT:
         case dev::eth::Instruction::CALLDATALOAD:
         case dev::eth::Instruction::BLOCKHASH:
-            influences(_funCall.arguments.at(0), returns.at(0));
+            influences(_args.at(0), returns.at(0));
             break;
 
         case dev::eth::Instruction::MLOAD:
-            visitMLoad(_funCall);
+            visitMLoad(_args);
             break;
 
         case dev::eth::Instruction::MSTORE:
-            visitMStore(_funCall);
+            visitMStore(_args);
             break;
 
         case dev::eth::Instruction::KECCAK256:
-            visitKeccak256(_funCall);
+            visitKeccak256(_args);
             break;
 
         case dev::eth::Instruction::MSTORE8:
@@ -1053,7 +1100,6 @@ void FunctionScope::visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionFo
         case dev::eth::Instruction::CALLDATACOPY:
             std::cout
                 << "memory not supported ("
-                << _funCall.functionName.name.str()
                 << ")"
                 << std::endl;
             break;
@@ -1074,9 +1120,9 @@ void FunctionScope::visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionFo
         case dev::eth::Instruction::EXTCODESIZE:
         case dev::eth::Instruction::BALANCE:
             state->taintVariable(returns.at(0));
-            state->protectVariable(_funCall.arguments.at(0));
+            state->protectVariable(_args.at(0));
 
-            influences(_funCall.arguments.at(0), returns.at(0));
+            influences(_args.at(0), returns.at(0));
             break;
 
         case dev::eth::Instruction::GAS:
@@ -1096,12 +1142,12 @@ void FunctionScope::visitBuiltin(FunctionCall const& _funCall, BuiltinFunctionFo
         case dev::eth::Instruction::SLOAD:
             std::cout << "SLOAD tainting " << returns.at(0).str() << std::endl;
             state->taintVariable(returns.at(0));
-            state->protectVariable(_funCall.arguments.at(0));
-            influences(_funCall.arguments.at(0), returns.at(0));
+            state->protectVariable(_args.at(0));
+            influences(_args.at(0), returns.at(0));
             break;
 
         case dev::eth::Instruction::SSTORE:
-            state->protectVariable(_funCall.arguments.at(0));
+            state->protectVariable(_args.at(0));
             break;
 
         case dev::eth::Instruction::JUMP:
@@ -1393,6 +1439,7 @@ std::vector<YulString> FunctionScope::findPath(YulString const& _source, YulStri
         {
             if (name == _dest)
             {
+                path.push_back(name);
                 return path;
             }
 
@@ -1469,17 +1516,19 @@ void FunctionScope::dump_state() const
     }
 }
 
-std::optional<YulString> State::verify() const
+std::set<YulString> State::verify() const
 {
+    std::set<YulString> invalid;
+
     for (auto const& kv: m_variables)
     {
         if (kv.second.isProtected() && kv.second.virtue() == Virtue::Tainted)
         {
-            return kv.first;
+            invalid.insert(kv.first);
         }
     }
 
-    return std::optional<YulString>();
+    return invalid;
 }
 
 void State::resolve()
@@ -1589,6 +1638,7 @@ public:
     void operator()(ForLoop const& _for) override;
     void operator()(Break const&) override;
     void operator()(Continue const&) override;
+    void operator()(FunctionalInstruction const& _instr) override;
 
     void dump_state() const;
 
@@ -1625,27 +1675,44 @@ std::vector<YulString> StateDestroyer::verify()
 {
     std::set<YulString> initially_tainted = m_state->taintedVariables();
     propagateTaint();
-    std::optional<YulString> violation = m_state->verify();
+    std::set<YulString> violation = m_state->verify();
 
-    if (!violation.has_value())
+    if (violation.empty())
     {
         return std::vector<YulString>();
     }
 
-    YulString untaintable = *violation;
-
+    std::vector<YulString> output;
     FunctionScope& main = m_state->function(MAIN);
 
-    for (auto const& init: initially_tainted)
+    for (YulString const& untaintable: violation)
     {
-        auto path = main.findPath(init, untaintable);
-        if (!path.empty())
+        bool found = false;
+
+        for (auto const& init: initially_tainted)
         {
-            return path;
+            auto path = main.findPath(init, untaintable);
+            if (!path.empty())
+            {
+                found = true;
+                std::stringstream ss;
+
+                for (auto const& var: path)
+                {
+                    ss << var.str() << " -> ";
+                }
+
+                std::string path_txt(ss.str());
+                path_txt.resize(path_txt.size() - 4);
+
+                output.push_back(YulString(path_txt));
+            }
         }
+
+        assertThrow(found, OptimizerException, "unable to find path");
     }
 
-    assertThrow(false, OptimizerException, "unable to find path");
+    return output;
 }
 
 void StateDestroyer::propagateTaint()
@@ -1657,6 +1724,11 @@ void StateDestroyer::propagateTaint()
 void StateDestroyer::resolve()
 {
     m_state->resolve();
+}
+
+void StateDestroyer::operator()(FunctionalInstruction const& _instr)
+{
+    (currentScope())(_instr);
 }
 
 void StateDestroyer::operator()(FunctionCall const& _funCall)
@@ -1729,12 +1801,11 @@ void OrderDependentStateDestroyer::run(OptimiserStepContext& _context, Block& _a
 
     if (!violation.empty())
     {
-        std::cout << "Taint violation:" << std::endl;
-        std::cout << "\t";
+        std::cout << "Taint violations:" << std::endl;
 
         for (auto const& foo: violation)
         {
-            std::cout << foo.str() << " -> ";
+            std::cout << "\t" << foo.str() << std::endl;
         }
 
         std::cout << std::endl;
