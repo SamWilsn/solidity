@@ -18,6 +18,7 @@
  * Optimiser suite that combines all steps and also provides the settings for the heuristics.
  */
 
+#include "libyul/optimiser/ZeroRetVar.h"
 #include <libyul/optimiser/Suite.h>
 
 #include <libyul/optimiser/Disambiguator.h>
@@ -129,16 +130,13 @@ void OptimiserSuite::run(
 				SSATransform::name,
 				RedundantAssignEliminator::name,
 				RedundantAssignEliminator::name,
+				ZeroRetVar::name,
 				OrderDependentStateDestroyer::name,
-			}, ast);
-			/*
 				ExpressionSimplifier::name,
 				CommonSubexpressionEliminator::name,
 				LoadResolver::name,
 				LoopInvariantCodeMotion::name
 			}, ast);
-			*/
-			return;
 		}
 
 		{
@@ -367,6 +365,7 @@ map<string, unique_ptr<OptimiserStep>> const& OptimiserSuite::allSteps()
 			LoadResolver,
 			LoopInvariantCodeMotion,
 			RedundantAssignEliminator,
+			ZeroRetVar,
 			OrderDependentStateDestroyer,
 			Rematerialiser,
 			SSAReverser,
